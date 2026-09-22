@@ -1,0 +1,1861 @@
+/**
+ * ¿QUIÉN MATÓ A ...? — Google Apps Script backend
+ * Multiplayer murder-mystery party game for 4–12 players.
+ *
+ * SECURITY:
+ * - DO NOT paste API keys into this file.
+ * - Add them in Apps Script > Project Settings > Script Properties:
+ *   GEMINI_API_KEY
+ *   CLOUDFLARE_API_TOKEN
+ *   CLOUDFLARE_ACCOUNT_ID
+ *
+ * Optional Script Properties:
+ *   GEMINI_TEXT_MODEL = gemini-3.8-flash
+ *   GEMINI_TTS_MODEL  = gemini-2.5-flash-preview-tts
+ *   CF_IMAGE_MODEL    = @cf/black-forest-labs/flux-2-klein-4b
+ */
+
+const QM = Object.freeze({
+  VERSION: '1.2.1',
+  MIN_PLAYERS: 4,
+  MAX_PLAYERS: 12,
+  TOTAL_ROUNDS: 5,
+  ROOM_TTL_HOURS: 12,
+  SHEET_ROOMS: 'QM_Salas',
+  SHEET_PLAYERS: 'QM_Jugadores',
+  SHEET_EVENTS: 'QM_Eventos',
+  PROP_DB_ID: 'QM_DB_SHEET_ID',
+  PROP_ASSET_FOLDER: 'QM_ASSET_FOLDER_ID',
+  GEMINI_TEXT_MODEL: 'gemini-3.8-flash',
+  GEMINI_TTS_MODEL: 'gemini-2.5-flash-preview-tts',
+  CF_IMAGE_MODEL: '@cf/black-forest-labs/flux-2-klein-4b',
+  AVATAR_SIZE: 448,
+  SCENE_WIDTH: 1024,
+  SCENE_HEIGHT: 576,
+});
+
+const ROOM_HEADERS = [
+  'room','hostKey','hostName','status','round','createdAt','updatedAt',
+  'victimId','killerId','storyJson','sceneAssetIdsJson','audioAssetIdsJson','resultJson',
+  'configJson','blueprintJson','prepStatus','prepError',
+  'caseRosterSignature','casePrepStatus','casePrepError'
+];
+
+const PLAYER_HEADERS = [
+  'room','playerId','token','name','avatarFileId','joinedAt','role','secret','alibi','vote','score','active',
+  'avatarStatus','avatarError'
+];
+
+const EVENT_HEADERS = ['timestamp','room','type','dataJson'];
+
+// -----------------------------
+// Web app
+// -----------------------------
+
+function doGet(e) {
+  setup_();
+  const p = (e && e.parameter) || {};
+  const t = HtmlService.createTemplateFromFile('Index');
+  t.bootJson = JSON.stringify({
+    view: String(p.view || '').toLowerCase(),
+    room: normalizeRoom_(p.room || ''),
+    hostKey: String(p.hostKey || ''),
+    version: QM.VERSION,
+    appUrl: getAppUrl_(),
+  });
+  return t.evaluate()
+    .setTitle('¿Quién mató a...?')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
+}
+
+function include(filename) {
+  return HtmlService.createHtmlOutputFromFile(filename).getContent();
+}
+
+// -----------------------------
+// One-click setup / diagnostics
+// -----------------------------
+
+function setup() {
+  setup_();
+  return {
+    ok: true,
+    dbId: getDb_().getId(),
+    assetFolderId: getAssetFolder_().getId(),
+    appUrl: getAppUrl_(),
+    version: QM.VERSION,
+  };
+}
+
+function diagnosticoApis() {
+  setup_();
+  const cfg = getConfig_();
+  const out = {
+    ok: true,
+    version: QM.VERSION,
+    gemini: { configured: !!cfg.geminiKey, ok: false, structuredOk: false, ttsOk: false, detail: '' },
+    cloudflare: {
+      configured: !!(cfg.cfToken && cfg.cfAccountId),
+      ok: false,
+      detail: '',
+      missingAccountId: !cfg.cfAccountId,
+    },
+  };
+
+  if (!cfg.geminiKey) {
+    out.ok = false;
+    out.gemini.detail = 'Falta GEMINI_API_KEY en Script Properties.';
+  } else {
+    try {
+      const txt = geminiText_('Responde únicamente con la palabra OK.', { maxOutputTokens: 16, temperature: 0 });
+      out.gemini.ok = /^OK\b/i.test(String(txt).trim());
+      const sj = geminiJson_('Devuelve un objeto JSON con ok=true y mensaje="OK".', {
+        type: 'object',
+        properties: { ok: { type: 'boolean' }, mensaje: { type: 'string' } },
+        required: ['ok','mensaje'],
+      });
+      out.gemini.structuredOk = !!(sj && sj.ok === true);
+      const ttsBlob = geminiTts_('Prueba de narración.', 0);
+      out.gemini.ttsOk = !!(ttsBlob && ttsBlob.getBytes().length > 100);
+      out.gemini.ok = !!(out.gemini.ok && out.gemini.structuredOk && out.gemini.ttsOk);
+      out.gemini.detail = out.gemini.ok ? 'Texto, JSON estructurado y TTS de Gemini respondieron correctamente.' : 'Gemini respondió, pero alguna capacidad no pasó la prueba.';
+    } catch (err) {
+      out.ok = false;
+      out.gemini.detail = safeError_(err);
+    }
+  }
+
+  if (!cfg.cfToken || !cfg.cfAccountId) {
+    out.ok = false;
+    out.cloudflare.detail = !cfg.cfAccountId
+      ? 'Falta CLOUDFLARE_ACCOUNT_ID. El token por sí solo no basta.'
+      : 'Falta CLOUDFLARE_API_TOKEN.';
+  } else {
+    try {
+      const blob = cloudflareImage_({
+        prompt: 'simple noir detective evidence card, one brass key on a dark table, comic 3D illustration, no text',
+        width: 256,
+        height: 256,
+        inputBlobs: [],
+      });
+      out.cloudflare.ok = blob && blob.getBytes().length > 1000;
+      out.cloudflare.detail = out.cloudflare.ok ? 'Cloudflare Workers AI generó una imagen de prueba.' : 'Cloudflare respondió sin una imagen válida.';
+    } catch (err) {
+      out.ok = false;
+      out.cloudflare.detail = safeError_(err);
+    }
+  }
+
+  out.ok = !!(out.gemini.ok && out.cloudflare.ok);
+  return out;
+}
+
+// -----------------------------
+// Public API used by Index.html
+// -----------------------------
+
+function apiCreateRoom(hostName) {
+  setup_();
+  hostName = hostName ? cleanName_(hostName) : '';
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const room = uniqueRoom_();
+    const hostKey = randomToken_(24);
+    appendObject_(getSheet_(QM.SHEET_ROOMS), ROOM_HEADERS, {
+      room,
+      hostKey,
+      hostName,
+      status: 'SETUP',
+      round: 0,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      victimId: '',
+      killerId: '',
+      storyJson: '',
+      sceneAssetIdsJson: '{}',
+      audioAssetIdsJson: '{}',
+      resultJson: '',
+      configJson: '{}',
+      blueprintJson: '',
+      prepStatus: 'IDLE',
+      prepError: '',
+      caseRosterSignature: '',
+      casePrepStatus: 'IDLE',
+      casePrepError: '',
+    });
+    logEvent_(room, 'ROOM_CREATED', { hostName, phase: 'SETUP' });
+    // Fuerza la escritura antes de redirigir a Ver partida/anfitrión.
+    SpreadsheetApp.flush();
+    return roomLinks_(room, hostKey);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Paso 1: finaliza la configuración y abre la sala a jugadores INMEDIATAMENTE.
+ * La historia se prepara en una segunda llamada (apiPrepareStory) para que el
+ * anfitrión no tenga que esperar a Gemini antes de mostrar el QR.
+ */
+
+function apiFinalizeSetup(room, hostKey, config) {
+  setup_();
+  room = normalizeRoom_(room);
+  const clean = normalizeGameConfig_(config || {});
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'SETUP') throw new Error('La configuración de esta sala ya fue finalizada.');
+    updateRoom_(room, {
+      hostName: '',
+      status: 'HOST_PROFILE',
+      configJson: JSON.stringify(clean),
+      blueprintJson: '',
+      prepStatus: 'PENDING',
+      prepError: '',
+      caseRosterSignature: '',
+      casePrepStatus: 'IDLE',
+      casePrepError: '',
+      updatedAt: new Date().toISOString(),
+    });
+    logEvent_(room, 'SETUP_FINALIZED', { config: clean, next: 'HOST_PROFILE' });
+    return { ok: true, room, status: 'HOST_PROFILE', prepStatus: 'PENDING' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Paso 2: prepara la historia base en una ejecución independiente.
+ * Puede llamarse desde el móvil del anfitrión o desde Ver partida.
+ * Un lock evita generar el caso dos veces si ambas pantallas lo piden a la vez.
+ */
+function apiPrepareStory(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  let clean;
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (['HOST_PROFILE','WAITING'].indexOf(String(r.status)) < 0) return { ok: false, skipped: true, reason: 'STATUS' };
+    if (String(r.prepStatus || '') === 'READY' && String(r.blueprintJson || '').trim()) {
+      return { ok: true, skipped: true, prepStatus: 'READY' };
+    }
+    if (String(r.prepStatus || '') === 'GENERATING') {
+      return { ok: true, skipped: true, prepStatus: 'GENERATING' };
+    }
+    clean = normalizeGameConfig_(parseJson_(r.configJson, {}));
+    updateRoom_(room, { prepStatus: 'GENERATING', prepError: '', updatedAt: new Date().toISOString() });
+    logEvent_(room, 'BLUEPRINT_GENERATING', {});
+  } finally {
+    lock.releaseLock();
+  }
+
+  let blueprint;
+  let warning = '';
+  let aiMode = 'GEMINI';
+  try {
+    blueprint = generateBlueprint_(room, clean);
+  } catch (err) {
+    aiMode = 'FALLBACK';
+    warning = safeError_(err);
+    blueprint = fallbackBlueprint_(clean);
+    logEvent_(room, 'BLUEPRINT_FALLBACK', { error: warning });
+  }
+
+  updateRoom_(room, {
+    blueprintJson: JSON.stringify(normalizeBlueprint_(blueprint, clean)),
+    prepStatus: 'READY',
+    prepError: warning,
+    updatedAt: new Date().toISOString(),
+  });
+  logEvent_(room, 'BLUEPRINT_READY', { aiMode });
+  return { ok: true, room, warning, prepStatus: 'READY' };
+}
+
+
+/**
+ * Registra al anfitrión como primer jugador DESPUÉS de guardar la configuración.
+ * El QR general permanece oculto hasta que su avatar esté preparado.
+ */
+function apiJoinHost(room, hostKey, name, photoDataUrl) {
+  setup_();
+  room = normalizeRoom_(room);
+  name = cleanName_(name);
+  if (!room || !name) throw new Error('El nombre del anfitrión es obligatorio.');
+  if (!photoDataUrl || !/^data:image\//i.test(photoDataUrl)) throw new Error('Debes tomar o seleccionar una foto.');
+
+  const photoBlob = dataUrlToBlob_(photoDataUrl, 'foto-anfitrion.jpg');
+  if (photoBlob.getBytes().length > 1800000) throw new Error('La foto es demasiado grande. Inténtalo de nuevo.');
+
+  let playerId = '';
+  let token = '';
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const r = requireHost_(room, hostKey);
+
+    // Si ya se completó el alta del anfitrión, devuelve su sesión en vez de duplicarlo.
+    const existing = getPlayers_(room, true).find(p => String(p.role || '') === 'HOST_PENDING');
+    if (r.status === 'WAITING' && existing && existing.avatarFileId) {
+      return { ok: true, room, playerId: existing.playerId, token: existing.token, avatarMode: String(existing.avatarStatus || 'READY'), reused: true };
+    }
+    if (r.status !== 'HOST_PROFILE') throw new Error('La sala no está esperando el perfil del anfitrión.');
+
+    if (existing) {
+      playerId = existing.playerId;
+      token = existing.token;
+      updatePlayer_(room, playerId, {
+        name,
+        avatarStatus: 'PROCESSING',
+        avatarError: '',
+        active: true,
+      });
+    } else {
+      playerId = 'P_' + randomToken_(10);
+      token = randomToken_(28);
+      appendObject_(getSheet_(QM.SHEET_PLAYERS), PLAYER_HEADERS, {
+        room,
+        playerId,
+        token,
+        name,
+        avatarFileId: '',
+        joinedAt: new Date().toISOString(),
+        role: 'HOST_PENDING',
+        secret: '',
+        alibi: '',
+        vote: '',
+        score: 0,
+        active: true,
+        avatarStatus: 'PROCESSING',
+        avatarError: '',
+      });
+    }
+    updateRoom_(room, { hostName: name, updatedAt: new Date().toISOString() });
+    logEvent_(room, 'HOST_PROFILE_STARTED', { playerId, name });
+    SpreadsheetApp.flush();
+  } finally {
+    lock.releaseLock();
+  }
+
+  let avatarMode = 'AI';
+  let warning = '';
+  let file;
+  try {
+    const avatarBlob = makeAvatar_(photoBlob, name);
+    file = saveAsset_(avatarBlob, room + '-avatar-' + playerId);
+    updatePlayer_(room, playerId, {
+      avatarFileId: file.getId(),
+      avatarStatus: 'READY',
+      avatarError: '',
+    });
+  } catch (err) {
+    avatarMode = 'PHOTO_FALLBACK';
+    warning = 'No se pudo crear la caricatura ahora. Se usará la foto temporalmente: ' + safeError_(err);
+    const fallback = photoBlob.copyBlob().setName('avatar-' + playerId + '.jpg');
+    file = saveAsset_(fallback, room + '-avatar-' + playerId);
+    updatePlayer_(room, playerId, {
+      avatarFileId: file.getId(),
+      avatarStatus: 'FALLBACK',
+      avatarError: warning,
+    });
+  }
+
+  updateRoom_(room, {
+    hostName: name,
+    status: 'WAITING',
+    storyJson: '',
+    sceneAssetIdsJson: '{}',
+    audioAssetIdsJson: '{}',
+    resultJson: '',
+    victimId: '',
+    killerId: '',
+    caseRosterSignature: '',
+    casePrepStatus: 'PENDING',
+    casePrepError: '',
+    updatedAt: new Date().toISOString(),
+  });
+  logEvent_(room, 'HOST_READY', { playerId, name, avatarMode });
+  SpreadsheetApp.flush();
+  return { ok: true, room, playerId, token, avatarMode, warning };
+}
+
+function apiJoin(room, name, photoDataUrl) {
+  setup_();
+  room = normalizeRoom_(room);
+  name = cleanName_(name);
+  if (!room || !name) throw new Error('Código de sala y nombre son obligatorios.');
+  if (!photoDataUrl || !/^data:image\//i.test(photoDataUrl)) throw new Error('Debes tomar o seleccionar una foto.');
+
+  const photoBlob = dataUrlToBlob_(photoDataUrl, 'foto.jpg');
+  if (photoBlob.getBytes().length > 1800000) throw new Error('La foto es demasiado grande. Inténtalo de nuevo.');
+
+  const playerId = 'P_' + randomToken_(10);
+  const token = randomToken_(28);
+
+  // Alta rápida: el jugador aparece en Ver partida mientras la IA crea el avatar.
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const r = requireRoom_(room);
+    if (r.status === 'SETUP') throw new Error('El anfitrión todavía está configurando la partida.');
+    if (r.status === 'HOST_PROFILE') throw new Error('El anfitrión está creando su personaje. Espera a que aparezca el QR general.');
+    if (r.status !== 'WAITING') throw new Error('La partida ya comenzó.');
+    const players = getPlayers_(room, true);
+    if (players.length >= QM.MAX_PLAYERS) throw new Error('La sala ya tiene el máximo de 12 jugadores.');
+    if (players.some(p => normalizeText_(p.name) === normalizeText_(name))) {
+      throw new Error('Ya existe un jugador con ese nombre.');
+    }
+
+    appendObject_(getSheet_(QM.SHEET_PLAYERS), PLAYER_HEADERS, {
+      room,
+      playerId,
+      token,
+      name,
+      avatarFileId: '',
+      joinedAt: new Date().toISOString(),
+      role: '',
+      secret: '',
+      alibi: '',
+      vote: '',
+      score: 0,
+      active: true,
+      avatarStatus: 'PROCESSING',
+      avatarError: '',
+    });
+    invalidatePreparedCase_(room, 'PLAYER_JOINED');
+    logEvent_(room, 'PLAYER_JOINED', { playerId, name, avatarStatus: 'PROCESSING' });
+  } finally {
+    lock.releaseLock();
+  }
+
+  let avatarMode = 'AI';
+  let warning = '';
+  let file;
+  try {
+    const avatarBlob = makeAvatar_(photoBlob, name);
+    file = saveAsset_(avatarBlob, room + '-avatar-' + playerId);
+    updatePlayer_(room, playerId, {
+      avatarFileId: file.getId(),
+      avatarStatus: 'READY',
+      avatarError: '',
+    });
+  } catch (err) {
+    // Respaldo: la partida continúa aunque Cloudflare falle temporalmente.
+    avatarMode = 'PHOTO_FALLBACK';
+    warning = 'No se pudo crear la caricatura ahora. Se usará tu foto temporalmente: ' + safeError_(err);
+    const fallback = photoBlob.copyBlob().setName('avatar-' + playerId + '.jpg');
+    file = saveAsset_(fallback, room + '-avatar-' + playerId);
+    updatePlayer_(room, playerId, {
+      avatarFileId: file.getId(),
+      avatarStatus: 'FALLBACK',
+      avatarError: warning,
+    });
+  }
+
+  touchRoom_(room);
+  logEvent_(room, 'AVATAR_READY', { playerId, name, avatarMode });
+  return { ok: true, room, playerId, token, avatarMode, warning };
+}
+
+function apiGetState(room, auth) {
+  setup_();
+  room = normalizeRoom_(room);
+  const r = requireRoom_(room);
+  const players = getPlayers_(room, true);
+  const story = parseJson_(r.storyJson, null);
+  const result = parseJson_(r.resultJson, null);
+  const scenes = parseJson_(r.sceneAssetIdsJson, {});
+  const audios = parseJson_(r.audioAssetIdsJson, {});
+  const config = parseJson_(r.configJson, {});
+  const blueprintReady = !!String(r.blueprintJson || '').trim() && String(r.prepStatus || '') === 'READY';
+  const avatarsReady = players.length > 0 && players.every(p => !!p.avatarFileId && String(p.avatarStatus || 'READY') !== 'PROCESSING');
+  const rosterSignature = rosterSignature_(players);
+  const casePrepared = !!String(r.storyJson || '').trim() &&
+    !!String(r.victimId || '').trim() &&
+    !!String(r.killerId || '').trim() &&
+    String(r.caseRosterSignature || '') === rosterSignature;
+  const scenesPrepared = Array.from({ length: QM.TOTAL_ROUNDS }, (_, i) => String(scenes[String(i + 1)] || ''))
+    .filter(id => id && id.indexOf('__GEN__') !== 0).length;
+
+  const victimPublic = ['ROUND','VOTING','REVEAL'].indexOf(String(r.status)) >= 0;
+  const publicPlayers = players.map(p => ({
+    playerId: p.playerId,
+    name: p.name,
+    avatarFileId: p.avatarFileId,
+    avatarStatus: String(p.avatarStatus || (p.avatarFileId ? 'READY' : 'PROCESSING')),
+    score: Number(p.score || 0),
+    active: truthy_(p.active),
+    isVictim: victimPublic && r.victimId === p.playerId,
+    voteSubmitted: !!p.vote,
+  }));
+
+  let privatePlayer = null;
+  let isHost = false;
+  auth = auth || {};
+  if (auth.playerToken) {
+    const me = players.find(p => p.token === String(auth.playerToken));
+    if (me) {
+      privatePlayer = {
+        playerId: me.playerId,
+        name: me.name,
+        role: me.role || '',
+        secret: me.secret || '',
+        alibi: me.alibi || '',
+        vote: me.vote || '',
+        score: Number(me.score || 0),
+        avatarStatus: String(me.avatarStatus || ''),
+      };
+    }
+  }
+  if (auth.hostKey && String(auth.hostKey) === String(r.hostKey)) isHost = true;
+
+  const currentRound = story && Number(r.round) > 0 ? story.rounds[Number(r.round) - 1] : null;
+  const voteCounts = (r.status === 'REVEAL' || isHost) ? countVotes_(players) : null;
+
+  return {
+    ok: true,
+    room,
+    hostName: r.hostName,
+    status: r.status,
+    round: Number(r.round || 0),
+    totalRounds: QM.TOTAL_ROUNDS,
+    players: publicPlayers,
+    currentRound: sanitizeRound_(currentRound),
+    caseTitle: story ? story.caseTitle : '',
+    location: story ? story.location : '',
+    victimId: victimPublic ? (r.victimId || '') : '',
+    sceneFileId: (String(scenes[String(r.round)] || '').indexOf('__GEN__') === 0 ? '' : (scenes[String(r.round)] || '')),
+    audioFileId: audios[String(r.round)] || '',
+    result: r.status === 'REVEAL' ? result : null,
+    voteCounts,
+    privatePlayer,
+    isHost,
+    links: isHost ? roomLinks_(room, r.hostKey) : null,
+    canStart: isHost && r.status === 'WAITING' && players.length >= QM.MIN_PLAYERS && avatarsReady && blueprintReady && casePrepared && (scenesPrepared >= 1 || !!String(r.casePrepError || '')),
+    minPlayers: QM.MIN_PLAYERS,
+    maxPlayers: QM.MAX_PLAYERS,
+    avatarsReady,
+    blueprintReady,
+    casePrepared,
+    scenesPrepared,
+    casePrepStatus: String(r.casePrepStatus || 'IDLE'),
+    casePrepError: isHost ? String(r.casePrepError || '') : '',
+    prepStatus: String(r.prepStatus || 'IDLE'),
+    prepError: isHost ? String(r.prepError || '') : '',
+    config: isHost ? config : null,
+    updatedAt: r.updatedAt,
+  };
+}
+
+function apiGetAsset(fileId) {
+  setup_();
+  fileId = String(fileId || '');
+  if (!fileId) return null;
+  const file = DriveApp.getFileById(fileId);
+  if (!isGameAsset_(file)) throw new Error('Recurso no autorizado.');
+  const blob = file.getBlob();
+  return {
+    fileId,
+    mimeType: blob.getContentType() || 'application/octet-stream',
+    base64: Utilities.base64Encode(blob.getBytes()),
+  };
+}
+
+
+/**
+ * Prepara el reparto definitivo del caso durante la sala de espera.
+ * Se ejecuta cuando hay al menos 4 jugadores, todas las caricaturas están listas
+ * y Gemini ya generó el guion base. Si entra alguien nuevo, se invalida y se rehace.
+ */
+function apiPrepareCase(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'WAITING') return { ok: false, skipped: true, reason: 'STATUS' };
+
+    const players = getPlayers_(room, true);
+    if (players.length < QM.MIN_PLAYERS) return { ok: false, skipped: true, reason: 'MIN_PLAYERS' };
+    if (players.some(p => !p.avatarFileId || String(p.avatarStatus || '') === 'PROCESSING')) {
+      return { ok: false, skipped: true, reason: 'AVATARS' };
+    }
+
+    const blueprint = parseJson_(r.blueprintJson, null);
+    if (!blueprint || String(r.prepStatus || '') !== 'READY') {
+      return { ok: false, skipped: true, reason: 'BLUEPRINT' };
+    }
+
+    const signature = rosterSignature_(players);
+    const scenes = parseJson_(r.sceneAssetIdsJson, {});
+    const sameCast = String(r.caseRosterSignature || '') === signature;
+    const storyReady = sameCast && !!String(r.storyJson || '').trim() && !!String(r.victimId || '') && !!String(r.killerId || '');
+
+    if (storyReady) {
+      const count = countPreparedScenes_(scenes);
+      const nextStatus = count >= QM.TOTAL_ROUNDS ? 'READY' : 'SCENES';
+      if (String(r.casePrepStatus || '') !== nextStatus) {
+        updateRoom_(room, { casePrepStatus: nextStatus, updatedAt: new Date().toISOString() });
+      }
+      return { ok: true, prepared: true, scenesPrepared: count, casePrepStatus: nextStatus };
+    }
+
+    const shuffled = shuffle_(players.slice());
+    const victim = shuffled[0];
+    const killer = shuffled[1];
+    const story = materializeStory_(blueprint, players, victim, killer);
+
+    updateRoom_(room, {
+      victimId: victim.playerId,
+      killerId: killer.playerId,
+      storyJson: JSON.stringify(story),
+      sceneAssetIdsJson: '{}',
+      audioAssetIdsJson: '{}',
+      resultJson: '',
+      caseRosterSignature: signature,
+      casePrepStatus: 'SCENES',
+      casePrepError: '',
+      updatedAt: new Date().toISOString(),
+    });
+    logEvent_(room, 'CASE_PREPARED', {
+      rosterSize: players.length,
+      victimId: victim.playerId,
+      killerId: killer.playerId,
+    });
+
+    return { ok: true, prepared: true, scenesPrepared: 0, casePrepStatus: 'SCENES' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Genera UNA escena por llamada para repartir la carga mientras los jugadores esperan.
+ * Host y Ver pantalla pueden invocarla; un marcador temporal evita duplicados.
+ */
+function apiPrepareCaseStep(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+
+  let targetRound = 0;
+  let expectedSignature = '';
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'WAITING') return { ok: false, skipped: true, reason: 'STATUS' };
+
+    const players = getPlayers_(room, true);
+    const signature = rosterSignature_(players);
+    expectedSignature = signature;
+
+    if (!String(r.storyJson || '').trim() || String(r.caseRosterSignature || '') !== signature) {
+      return { ok: false, skipped: true, reason: 'CASE_NOT_READY' };
+    }
+
+    const scenes = parseJson_(r.sceneAssetIdsJson, {});
+    for (let round = 1; round <= QM.TOTAL_ROUNDS; round++) {
+      const value = String(scenes[String(round)] || '');
+      if (isPreparedAssetId_(value)) continue;
+
+      if (value.indexOf('__GEN__:') === 0) {
+        const ts = Number(value.split(':')[1] || 0);
+        if (ts && (Date.now() - ts) < 120000) {
+          return { ok: true, skipped: true, busy: true, scenesPrepared: countPreparedScenes_(scenes) };
+        }
+      }
+
+      targetRound = round;
+      scenes[String(round)] = '__GEN__:' + Date.now();
+      updateRoom_(room, {
+        sceneAssetIdsJson: JSON.stringify(scenes),
+        casePrepStatus: 'SCENES',
+        casePrepError: '',
+        updatedAt: new Date().toISOString(),
+      });
+      break;
+    }
+
+    if (!targetRound) {
+      updateRoom_(room, {
+        casePrepStatus: 'READY',
+        casePrepError: '',
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true, ready: true, scenesPrepared: QM.TOTAL_ROUNDS, casePrepStatus: 'READY' };
+    }
+  } finally {
+    lock.releaseLock();
+  }
+
+  let fileId = '';
+  let generationError = '';
+  try {
+    fileId = generateRoundSceneFile_(room, targetRound);
+  } catch (err) {
+    generationError = safeError_(err);
+  }
+
+  const lock2 = LockService.getScriptLock();
+  lock2.waitLock(20000);
+  try {
+    const r2 = requireHost_(room, hostKey);
+    const players2 = getPlayers_(room, true);
+    const currentSignature = rosterSignature_(players2);
+
+    // Si entró alguien durante la generación, no mezclar una escena del reparto antiguo.
+    if (r2.status !== 'WAITING' ||
+        String(r2.caseRosterSignature || '') !== expectedSignature ||
+        currentSignature !== expectedSignature) {
+      if (fileId) {
+        try { DriveApp.getFileById(fileId).setTrashed(true); } catch (e) {}
+      }
+      return { ok: true, stale: true };
+    }
+
+    const scenes2 = parseJson_(r2.sceneAssetIdsJson, {});
+    if (generationError) {
+      delete scenes2[String(targetRound)];
+      updateRoom_(room, {
+        sceneAssetIdsJson: JSON.stringify(scenes2),
+        casePrepStatus: 'ERROR',
+        casePrepError: generationError,
+        updatedAt: new Date().toISOString(),
+      });
+      logEvent_(room, 'CASE_SCENE_ERROR', { round: targetRound, error: generationError });
+      return { ok: false, round: targetRound, error: generationError, scenesPrepared: countPreparedScenes_(scenes2) };
+    }
+
+    scenes2[String(targetRound)] = fileId;
+    const count = countPreparedScenes_(scenes2);
+    const done = count >= QM.TOTAL_ROUNDS;
+    updateRoom_(room, {
+      sceneAssetIdsJson: JSON.stringify(scenes2),
+      casePrepStatus: done ? 'READY' : 'SCENES',
+      casePrepError: '',
+      updatedAt: new Date().toISOString(),
+    });
+    logEvent_(room, 'CASE_SCENE_READY', { round: targetRound, scenesPrepared: count });
+    return { ok: true, round: targetRound, fileId, scenesPrepared: count, casePrepStatus: done ? 'READY' : 'SCENES' };
+  } finally {
+    lock2.releaseLock();
+  }
+}
+
+
+function apiStart(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+
+  let needFirstScene = false;
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'WAITING') throw new Error('La sala todavía no está lista para iniciar.');
+
+    const players = getPlayers_(room, true);
+    if (players.length < QM.MIN_PLAYERS) throw new Error('Se necesitan al menos ' + QM.MIN_PLAYERS + ' jugadores.');
+    if (players.some(p => !p.avatarFileId || String(p.avatarStatus || '') === 'PROCESSING')) {
+      throw new Error('Todavía hay caricaturas procesándose. Espera unos segundos.');
+    }
+
+    const signature = rosterSignature_(players);
+    let story = parseJson_(r.storyJson, null);
+    let victim = players.find(p => p.playerId === String(r.victimId || ''));
+    let killer = players.find(p => p.playerId === String(r.killerId || ''));
+    const preparedForThisCast = story && victim && killer && String(r.caseRosterSignature || '') === signature;
+
+    if (!preparedForThisCast) {
+      let blueprint = parseJson_(r.blueprintJson, null);
+      const config = parseJson_(r.configJson, {});
+      if (!blueprint) {
+        blueprint = fallbackBlueprint_(config);
+        logEvent_(room, 'BLUEPRINT_MISSING_FALLBACK', {});
+      }
+      const shuffled = shuffle_(players.slice());
+      victim = shuffled[0];
+      killer = shuffled[1];
+      story = materializeStory_(blueprint, players, victim, killer);
+      updateRoom_(room, {
+        victimId: victim.playerId,
+        killerId: killer.playerId,
+        storyJson: JSON.stringify(story),
+        sceneAssetIdsJson: '{}',
+        caseRosterSignature: signature,
+        casePrepStatus: 'SCENES',
+        casePrepError: '',
+      });
+    }
+
+    const latest = requireRoom_(room);
+    const scenes = parseJson_(latest.sceneAssetIdsJson, {});
+    needFirstScene = !isPreparedAssetId_(String(scenes['1'] || ''));
+
+    updateRoom_(room, {
+      status: 'ROUND',
+      round: 1,
+      audioAssetIdsJson: '{}',
+      resultJson: '',
+      updatedAt: new Date().toISOString(),
+    });
+
+    applySecrets_(room, story.secrets);
+    clearVotes_(room);
+    logEvent_(room, 'GAME_STARTED', {
+      victimId: victim.playerId,
+      killerId: killer.playerId,
+      storyMode: preparedForThisCast ? 'PRELOADED' : 'ON_START',
+    });
+  } finally {
+    lock.releaseLock();
+  }
+
+  let assetWarning = '';
+  if (needFirstScene) {
+    try { ensureRoundScene_(room, 1); } catch (err) {
+      assetWarning = safeError_(err);
+      logEvent_(room, 'SCENE_ERROR', { round: 1, error: assetWarning });
+    }
+  }
+  return { ok: true, room, round: 1, warning: assetWarning };
+}
+
+function apiWarmScene(room, hostKey, round) {
+  setup_();
+  room = normalizeRoom_(room);
+  round = Number(round || 0);
+  const r = requireHost_(room, hostKey);
+  if (r.status !== 'ROUND') return { ok: false, skipped: true };
+  if (round < 1 || round > QM.TOTAL_ROUNDS) return { ok: false, skipped: true };
+  if (round <= Number(r.round || 0)) return { ok: true, skipped: true };
+  const fileId = ensureRoundScene_(room, round);
+  return { ok: true, round, fileId };
+}
+
+function apiNextRound(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  let next;
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'ROUND') throw new Error('No se puede avanzar desde el estado actual.');
+    const current = Number(r.round || 0);
+    if (current >= QM.TOTAL_ROUNDS) throw new Error('Ya estás en la última ronda. Abre la votación.');
+    next = current + 1;
+    updateRoom_(room, { round: next, updatedAt: new Date().toISOString() });
+    logEvent_(room, 'ROUND_CHANGED', { round: next });
+  } finally {
+    lock.releaseLock();
+  }
+
+  let warning = '';
+  try { ensureRoundScene_(room, next); } catch (err) { warning = safeError_(err); logEvent_(room, 'SCENE_ERROR', { round: next, error: warning }); }
+  return { ok: true, room, round: next, warning };
+}
+
+function apiOpenVoting(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'ROUND' || Number(r.round) < QM.TOTAL_ROUNDS) {
+      throw new Error('La votación final se abre después de la ronda 5.');
+    }
+    clearVotes_(room);
+    updateRoom_(room, { status: 'VOTING', updatedAt: new Date().toISOString() });
+    logEvent_(room, 'VOTING_OPENED', {});
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function apiVote(room, playerToken, suspectId) {
+  setup_();
+  room = normalizeRoom_(room);
+  suspectId = String(suspectId || '');
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const r = requireRoom_(room);
+    if (r.status !== 'VOTING') throw new Error('La votación no está abierta.');
+    const players = getPlayers_(room, true);
+    const me = players.find(p => p.token === String(playerToken || ''));
+    if (!me) throw new Error('Sesión de jugador no válida.');
+    if (!players.some(p => p.playerId === suspectId)) throw new Error('Sospechoso no válido.');
+    if (me.playerId === suspectId) throw new Error('No puedes votarte a ti mismo.');
+    updatePlayer_(room, me.playerId, { vote: suspectId });
+    touchRoom_(room);
+    logEvent_(room, 'VOTE', { voter: me.playerId });
+    return { ok: true };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function apiReveal(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'VOTING') throw new Error('Primero abre la votación.');
+    const players = getPlayers_(room, true);
+    const story = parseJson_(r.storyJson, {});
+    const killer = players.find(p => p.playerId === r.killerId);
+    const victim = players.find(p => p.playerId === r.victimId);
+    const counts = countVotes_(players);
+    const correct = players.filter(p => p.vote === r.killerId);
+    const votedCount = players.filter(p => !!p.vote).length;
+    const killerEscaped = correct.length < Math.ceil(Math.max(votedCount, 1) / 2);
+
+    players.forEach(p => {
+      let delta = 0;
+      if (p.vote === r.killerId) delta += 100;
+      if (p.playerId === r.killerId && killerEscaped) delta += 150;
+      if (p.playerId === r.victimId && p.vote === r.killerId) delta += 50;
+      if (delta) updatePlayer_(room, p.playerId, { score: Number(p.score || 0) + delta });
+    });
+
+    const result = {
+      killerId: r.killerId,
+      killerName: killer ? killer.name : 'Desconocido',
+      victimId: r.victimId,
+      victimName: victim ? victim.name : 'Desconocido',
+      motive: story.finalReveal && story.finalReveal.motive || 'Un secreto que llevaba demasiado tiempo enterrado.',
+      method: story.finalReveal && story.finalReveal.method || 'El crimen fue preparado para desviar todas las sospechas.',
+      explanation: story.finalReveal && story.finalReveal.explanation || 'Las pistas encajaban cuando se revisaron las contradicciones.',
+      finalLine: story.finalReveal && story.finalReveal.finalLine || 'La verdad siempre deja una huella.',
+      voteCounts: counts,
+      correctPlayerIds: correct.map(p => p.playerId),
+      killerEscaped,
+    };
+    updateRoom_(room, { status: 'REVEAL', resultJson: JSON.stringify(result), updatedAt: new Date().toISOString() });
+    logEvent_(room, 'REVEAL', { killerId: r.killerId, correct: result.correctPlayerIds });
+    return { ok: true, result };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function apiNarrate(room, round) {
+  setup_();
+  room = normalizeRoom_(room);
+  round = Number(round || 0);
+  const r = requireRoom_(room);
+  const story = parseJson_(r.storyJson, null);
+  if (!story || !story.rounds || !story.rounds[round - 1]) throw new Error('Ronda no disponible.');
+  const audios = parseJson_(r.audioAssetIdsJson, {});
+  if (audios[String(round)]) return { ok: true, fileId: audios[String(round)], cached: true };
+
+  const narration = String(story.rounds[round - 1].narration || '').slice(0, 1600);
+  const blob = geminiTts_(narration, round);
+  const file = saveAsset_(blob, room + '-audio-r' + round);
+  audios[String(round)] = file.getId();
+  updateRoom_(room, { audioAssetIdsJson: JSON.stringify(audios), updatedAt: new Date().toISOString() });
+  logEvent_(room, 'AUDIO_CREATED', { round });
+  return { ok: true, fileId: file.getId(), cached: false };
+}
+
+function apiCloseRoom(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  requireHost_(room, hostKey);
+  updateRoom_(room, { status: 'CLOSED', updatedAt: new Date().toISOString() });
+  logEvent_(room, 'ROOM_CLOSED', {});
+  return { ok: true };
+}
+
+// -----------------------------
+// AI: Gemini story + TTS
+// -----------------------------
+
+function generateBlueprint_(room, config) {
+  config = normalizeGameConfig_(config || {});
+  const prompt = [
+    'Eres guionista senior de un party game social llamado “¿Quién mató a [jugador]?”.',
+    'Crea un CASO BASE completamente original con sabor a thriller de telenovela venezolana: secretos, traiciones, dinero, celos, alianzas, pistas falsas y un giro lógico.',
+    'No copies ninguna novela, personaje, escena ni diálogo existente.',
+    'El caso se prepara ANTES de saber quiénes serán los jugadores. Usa el marcador [VICTIM] para la futura víctima y [KILLER] SOLO dentro de finalReveal.',
+    'Nunca uses [KILLER] en las narraciones, pistas, evidencias ni prompts visuales de las rondas.',
+    'Debe ser elegante, misterioso y apto para reunión de amigos, sin gore ni violencia gráfica.',
+    'Configuración elegida por el anfitrión: ' + JSON.stringify(config),
+    config.storyStyle === 'La Mujer de Judas'
+      ? 'Dirección narrativa: misterio ORIGINAL inspirado únicamente en el arquetipo de una figura velada/enmascarada, identidad incierta, pueblo o círculo lleno de secretos y sospechosos. NO copies argumento, personajes, frases, asesinatos ni final de la telenovela “La Mujer de Judas”.'
+      : ('Dirección narrativa seleccionada: ' + config.storyStyle + '. Mantén la historia completamente original.'),
+    'Crea exactamente 5 rondas. Cada ronda: 70–130 palabras de narración, una pista pública, una evidencia, y un prompt visual 16:9 para ilustración 3D cómic SIN texto.',
+    'Las pistas de rondas 2–5 deben permitir deducir la solución al final mediante una contradicción concreta.',
+    'La primera ronda presenta el lugar, a [VICTIM] y una amenaza o detalle inquietante. La segunda descubre el crimen de forma no gráfica.',
+    'En finalReveal sí puedes usar [KILLER] y [VICTIM].',
+    'Sala interna: ' + room,
+  ].join('\n');
+
+  const schema = {
+    type: 'OBJECT',
+    properties: {
+      caseTitle: { type: 'STRING' },
+      location: { type: 'STRING' },
+      synopsis: { type: 'STRING' },
+      rounds: {
+        type: 'ARRAY', minItems: 5, maxItems: 5,
+        items: {
+          type: 'OBJECT',
+          properties: {
+            n: { type: 'INTEGER' },
+            title: { type: 'STRING' },
+            narration: { type: 'STRING' },
+            publicClue: { type: 'STRING' },
+            evidenceTitle: { type: 'STRING' },
+            evidenceText: { type: 'STRING' },
+            imagePrompt: { type: 'STRING' },
+          },
+          required: ['n','title','narration','publicClue','evidenceTitle','evidenceText','imagePrompt'],
+        },
+      },
+      finalReveal: {
+        type: 'OBJECT',
+        properties: {
+          motive: { type: 'STRING' }, method: { type: 'STRING' }, explanation: { type: 'STRING' }, finalLine: { type: 'STRING' },
+        },
+        required: ['motive','method','explanation','finalLine'],
+      },
+    },
+    required: ['caseTitle','location','synopsis','rounds','finalReveal'],
+  };
+  return geminiJson_(prompt, schema);
+}
+
+
+function normalizeGameConfig_(config) {
+  const locations = ['Aleatoria','Tren nocturno','Mansión aislada','Hotel elegante','Fiesta privada','Pueblo venezolano','Casa de campo'];
+  const moods = ['Dramático','Oscuro','Intriga elegante','Telenovela de misterio'];
+  const storyStyles = ['La Mujer de Judas','Caso original','Novia enmascarada','Secretos de familia'];
+  let location = String(config.location || 'Aleatoria');
+  let mood = String(config.mood || 'Telenovela de misterio');
+  let storyStyle = String(config.storyStyle || 'La Mujer de Judas');
+  if (locations.indexOf(location) < 0) location = 'Aleatoria';
+  if (moods.indexOf(mood) < 0) mood = 'Telenovela de misterio';
+  if (storyStyles.indexOf(storyStyle) < 0) storyStyle = 'La Mujer de Judas';
+  return {
+    location,
+    mood,
+    storyStyle,
+    rounds: QM.TOTAL_ROUNDS,
+    artStyle: 'Cómic 3D cinematográfico',
+  };
+}
+
+function normalizeBlueprint_(bp, config) {
+  const fb = fallbackBlueprint_(config || {});
+  bp = bp || {};
+  const rounds = Array.isArray(bp.rounds) ? bp.rounds : [];
+  return {
+    caseTitle: String(bp.caseTitle || fb.caseTitle).slice(0, 130),
+    location: String(bp.location || fb.location).slice(0, 180),
+    synopsis: String(bp.synopsis || fb.synopsis).slice(0, 700),
+    rounds: Array.from({ length: QM.TOTAL_ROUNDS }, (_, i) => {
+      const src = rounds[i] || fb.rounds[i];
+      return {
+        n: i + 1,
+        title: String(src.title || fb.rounds[i].title).slice(0, 100),
+        narration: String(src.narration || fb.rounds[i].narration).slice(0, 1800),
+        publicClue: String(src.publicClue || fb.rounds[i].publicClue).slice(0, 500),
+        evidenceTitle: String(src.evidenceTitle || fb.rounds[i].evidenceTitle).slice(0, 120),
+        evidenceText: String(src.evidenceText || fb.rounds[i].evidenceText).slice(0, 600),
+        imagePrompt: String(src.imagePrompt || fb.rounds[i].imagePrompt).slice(0, 1300),
+      };
+    }),
+    finalReveal: {
+      motive: String((bp.finalReveal || {}).motive || fb.finalReveal.motive).slice(0, 700),
+      method: String((bp.finalReveal || {}).method || fb.finalReveal.method).slice(0, 700),
+      explanation: String((bp.finalReveal || {}).explanation || fb.finalReveal.explanation).slice(0, 1300),
+      finalLine: String((bp.finalReveal || {}).finalLine || fb.finalReveal.finalLine).slice(0, 500),
+    },
+  };
+}
+
+function materializeStory_(blueprint, players, victim, killer) {
+  const bp = normalizeBlueprint_(blueprint, {});
+  const pub = s => replaceCaseTokens_(s, victim.name, '');
+  const fin = s => replaceCaseTokens_(s, victim.name, killer.name);
+  const rounds = bp.rounds.map((r, i) => ({
+    n: i + 1,
+    title: pub(r.title),
+    narration: pub(r.narration),
+    publicClue: pub(r.publicClue),
+    evidenceTitle: pub(r.evidenceTitle),
+    evidenceText: pub(r.evidenceText),
+    imagePrompt: pub(r.imagePrompt),
+    featuredPlayerIds: featuredPlayersForRound_(players, victim, i + 1),
+  }));
+  const secrets = buildPrivateSecrets_(players, victim, killer, {
+    motive: fin(bp.finalReveal.motive),
+    location: pub(bp.location),
+  });
+  return {
+    caseTitle: pub(bp.caseTitle),
+    location: pub(bp.location),
+    synopsis: pub(bp.synopsis),
+    rounds,
+    secrets,
+    finalReveal: {
+      motive: fin(bp.finalReveal.motive),
+      method: fin(bp.finalReveal.method),
+      explanation: fin(bp.finalReveal.explanation),
+      finalLine: fin(bp.finalReveal.finalLine),
+    },
+  };
+}
+
+function replaceCaseTokens_(value, victimName, killerName) {
+  let s = String(value || '');
+  s = s.replace(/\[VICTIM\]/gi, victimName || 'la víctima');
+  s = s.replace(/\[KILLER\]/gi, killerName || 'una persona del grupo');
+  return s;
+}
+
+function featuredPlayersForRound_(players, victim, round) {
+  const others = players.filter(p => p.playerId !== victim.playerId);
+  if (!others.length) return [victim.playerId];
+  const picked = [];
+  const start = ((round - 1) * 3) % others.length;
+  for (let i = 0; i < Math.min(3, others.length); i++) picked.push(others[(start + i) % others.length].playerId);
+  if (round <= 2) picked.unshift(victim.playerId);
+  return unique_(picked).slice(0, 4);
+}
+
+function buildPrivateSecrets_(players, victim, killer, ctx) {
+  const motives = [
+    'ocultaste una deuda que tenías con [VICTIM]',
+    'borraste un mensaje que [VICTIM] te envió esa tarde',
+    'discutiste con [VICTIM] por un secreto familiar',
+    'entraste en una zona donde dijiste no haber estado',
+    'conocías una información que [VICTIM] pensaba revelar',
+    'mentiste sobre la hora en la que viste por última vez a [VICTIM]',
+    'guardabas una fotografía que podía cambiar la investigación',
+    'tenías una relación secreta con alguien del grupo',
+    'encontraste una de las pruebas antes que los demás y no lo dijiste',
+    'habías firmado un acuerdo privado con [VICTIM]',
+    'escuchaste una conversación comprometida y decidiste callarla',
+    'llevabas un objeto parecido a una de las evidencias',
+  ];
+  const shuffled = shuffle_(motives.slice());
+  let j = 0;
+  return players.map((p, idx) => {
+    if (p.playerId === victim.playerId) {
+      return {
+        playerId: p.playerId, role: 'VICTIM',
+        secret: 'Eres la víctima de este caso. Sigues participando como investigador fantasma: analiza las pistas y vota al final.',
+        alibi: 'Tu objetivo es reconstruir qué ocurrió y descubrir quién te mató.',
+      };
+    }
+    if (p.playerId === killer.playerId) {
+      return {
+        playerId: p.playerId, role: 'KILLER',
+        secret: 'Tú eres quien mató a ' + victim.name + '. Tu motivo está relacionado con esto: ' + String(ctx.motive || 'un secreto que no podía salir a la luz') + '. Defiéndete sin confesar y aprovecha las dudas razonables.',
+        alibi: 'Afirmas que durante el momento clave estabas lejos de la escena. Mantén tu versión mientras las pistas no la contradigan.',
+      };
+    }
+    const seed = shuffled[j++ % shuffled.length].replace(/\[VICTIM\]/g, victim.name);
+    return {
+      playerId: p.playerId, role: 'SUSPECT',
+      secret: 'Tu secreto: ' + seed + '. No eres el asesino, pero esta información puede hacerte parecer culpable.',
+      alibi: idx % 2 ? 'Tu coartada tiene un intervalo de varios minutos que nadie puede confirmar.' : 'Dices haber estado con el grupo, aunque una parte de tu recorrido no tiene testigos.',
+    };
+  });
+}
+
+function fallbackBlueprint_(config) {
+  config = normalizeGameConfig_(config || {});
+  const chosenLocation = config.location === 'Aleatoria' ? 'Una antigua casa preparada para una celebración privada' : config.location;
+  return {
+    caseTitle: 'El último secreto de [VICTIM]',
+    location: chosenLocation,
+    synopsis: 'Una reunión entre conocidos termina cuando [VICTIM] decide revelar una verdad que alguien necesitaba mantener enterrada.',
+    rounds: [
+      { n: 1, title: 'La advertencia', narration: 'La noche comenzó como una reunión aparentemente normal. [VICTIM] llegó con una noticia importante, pero antes de poder compartirla apareció un sobre sin remitente. Dentro había una advertencia: “Esta noche la verdad tendrá un precio”. Nadie reconoció la letra. Poco después, [VICTIM] se apartó del grupo para atender una llamada. Una figura apenas visible cruzó al fondo, pero nadie pudo distinguir quién era.', publicClue: 'El sobre apareció cuando casi todos estaban reunidos y alguien conocía la rutina de [VICTIM].', evidenceTitle: 'El sobre anónimo', evidenceText: 'Una esquina fue arrancada y el papel tiene una marca que parece deliberada.', imagePrompt: 'Show [VICTIM] in the chosen mystery location, reading an anonymous envelope while an indistinct gender-ambiguous shadow stands far behind. Premium 3D comic style, suspense, non-graphic.' },
+      { n: 2, title: 'El silencio', narration: 'Un ruido breve interrumpió la conversación. Cuando fueron a buscar a [VICTIM], la encontraron inmóvil en una estancia cercana. La escena no mostraba una lucha prolongada. Un reloj había sido manipulado y, junto a la entrada, apareció un objeto pequeño que no pertenecía a la víctima. La hora que todos creen recordar no coincide con la cronología real.', publicClue: 'El reloj fue alterado después del momento real del crimen.', evidenceTitle: 'El reloj detenido', evidenceText: 'El mecanismo funciona. Alguien movió las agujas a propósito.', imagePrompt: 'Tasteful non-graphic mystery crime scene with [VICTIM] partly in shadow, manipulated clock, a small clue on the floor, concerned group at the doorway, cinematic 3D comic.' },
+      { n: 3, title: 'Todos ocultaban algo', narration: 'Las versiones empiezan a romperse. Salen a la luz deudas, mensajes borrados y conversaciones privadas. Una evidencia parece apuntar de forma demasiado perfecta hacia una persona, como si alguien quisiera que fuese encontrada. El detalle más extraño es una fibra adherida al objeto hallado cerca de la escena: no identifica a nadie por sí sola, pero demuestra que la prueba fue manipulada.', publicClue: 'Una de las pruebas fue colocada para dirigir las sospechas.', evidenceTitle: 'La fibra', evidenceText: 'No pertenece a la víctima y apareció sobre una evidencia que había sido limpiada.', imagePrompt: 'Detective evidence table, magnifying glass, fabric fiber, torn note, several ambiguous suspects in the background, premium comic 3D noir lighting.' },
+      { n: 4, title: 'La frase imposible', narration: 'Al reconstruir los minutos anteriores al crimen surge una contradicción. Una persona describió un detalle de la escena que todavía no había sido comunicado al grupo. Podía parecer un comentario casual, pero solo alguien que hubiera estado allí habría podido conocerlo. La coartada que parecía más sólida empieza a resquebrajarse.', publicClue: 'Alguien conocía un detalle de la escena antes de que se hiciera público.', evidenceTitle: 'Una declaración', evidenceText: 'La frase fue dicha demasiado pronto y contradice la versión inicial.', imagePrompt: 'Dramatic group interrogation in the mystery location, one person tense but identity not highlighted, evidence board and clock in background, 3D comic thriller.' },
+      { n: 5, title: 'La pieza que faltaba', narration: 'La última prueba conecta la amenaza, la falsa cronología y el verdadero motivo. [VICTIM] guardaba información que pensaba revelar esa misma noche. Quien cometió el crimen no buscaba dinero inmediato: buscaba tiempo y silencio. La evidencia final demuestra que las pistas falsas fueron preparadas por la misma persona que conocía el secreto.', publicClue: 'El motivo está relacionado con la información que [VICTIM] iba a revelar.', evidenceTitle: 'La llave del secreto', evidenceText: 'Abre el lugar donde estaba escondida la información que originó todo.', imagePrompt: 'Close-up of a brass key beside sealed documents and reflections of several suspects, cinematic premium 3D graphic novel style, no text.' },
+    ],
+    finalReveal: {
+      motive: '[KILLER] necesitaba impedir que [VICTIM] revelara información capaz de cambiar su vida.',
+      method: '[KILLER] manipuló la cronología y colocó evidencias falsas para repartir las sospechas.',
+      explanation: 'La pista decisiva fue que [KILLER] conocía un detalle de la escena antes de que se hiciera público. El reloj alterado y la última evidencia demostraron que la cronología había sido fabricada.',
+      finalLine: 'Todos tenían algo que ocultar. Solo [KILLER] necesitaba silenciar a [VICTIM].',
+    },
+  };
+}
+
+function geminiText_(prompt, opts) {
+  const cfg = getConfig_();
+  if (!cfg.geminiKey) throw new Error('GEMINI_API_KEY no configurada.');
+  opts = opts || {};
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(cfg.geminiTextModel) + ':generateContent';
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: String(prompt) }] }],
+    generationConfig: {
+      temperature: typeof opts.temperature === 'number' ? opts.temperature : 0.9,
+      maxOutputTokens: opts.maxOutputTokens || 4096,
+    },
+  };
+  const res = fetchWithRetry_(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': cfg.geminiKey },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+  }, 2);
+  assertHttp_(res, 'Gemini');
+  const json = JSON.parse(res.getContentText());
+  const text = (((json.candidates || [])[0] || {}).content || {}).parts || [];
+  return text.map(p => p.text || '').join('').trim();
+}
+
+function geminiJson_(prompt, schema) {
+  const cfg = getConfig_();
+  if (!cfg.geminiKey) throw new Error('GEMINI_API_KEY no configurada.');
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(cfg.geminiTextModel) + ':generateContent';
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: String(prompt) }] }],
+    generationConfig: {
+      temperature: 1.05,
+      maxOutputTokens: 10000,
+      responseMimeType: 'application/json',
+      responseSchema: normalizeGeminiSchema_(schema),
+    },
+  };
+  const res = fetchWithRetry_(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': cfg.geminiKey },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+  }, 2);
+  assertHttp_(res, 'Gemini');
+  const json = JSON.parse(res.getContentText());
+  const parts = ((((json.candidates || [])[0] || {}).content || {}).parts || []);
+  const text = parts.map(p => p.text || '').join('').trim();
+  if (!text) throw new Error('Gemini no devolvió contenido JSON.');
+  try { return JSON.parse(text); } catch (err) { throw new Error('Gemini devolvió JSON no válido: ' + text.slice(0, 250)); }
+}
+
+function geminiTts_(narration, round) {
+  const cfg = getConfig_();
+  if (!cfg.geminiKey) throw new Error('GEMINI_API_KEY no configurada.');
+  const model = cfg.geminiTtsModel;
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent';
+  const direction = 'Narra en español latino neutro, como narrador de thriller televisivo: grave, elegante, intrigante, con pausas naturales. No leas estas instrucciones. TEXTO: ';
+  const body = {
+    contents: [{ parts: [{ text: direction + narration }] }],
+    generationConfig: {
+      responseModalities: ['AUDIO'],
+      speechConfig: {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Charon' } },
+      },
+    },
+  };
+  const res = fetchWithRetry_(url, {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': cfg.geminiKey },
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true,
+  }, 2);
+  assertHttp_(res, 'Gemini TTS');
+  const json = JSON.parse(res.getContentText());
+  const part = (((((json.candidates || [])[0] || {}).content || {}).parts || [])[0] || {});
+  const b64 = part.inlineData && part.inlineData.data;
+  if (!b64) throw new Error('Gemini TTS no devolvió audio.');
+  const pcm = Utilities.base64Decode(b64);
+  return pcmToWavBlob_(pcm, 24000, 1, 16, 'narracion-r' + round + '.wav');
+}
+
+// -----------------------------
+// AI: Cloudflare images
+// -----------------------------
+
+function makeAvatar_(photoBlob, name) {
+  const prompt = [
+    'Transform the person in input image 0 into a premium stylized 3D comic-book game avatar.',
+    'Preserve recognizable facial features, skin tone, hairstyle, glasses and distinguishing traits.',
+    'Bust portrait, shoulders visible, confident neutral expression, cinematic soft rim light.',
+    'Consistent modern mystery-game art direction, polished 3D illustration, clean dark-neutral background.',
+    'No text, no logos, no extra people, no distortion.',
+    'The character will be used as ' + String(name) + ' in a multiplayer detective game.',
+  ].join(' ');
+  return cloudflareImage_({
+    prompt,
+    width: QM.AVATAR_SIZE,
+    height: QM.AVATAR_SIZE,
+    inputBlobs: [photoBlob],
+  }).setName('avatar-' + cleanFileName_(name) + '.png');
+}
+
+
+function ensureRoundScene_(room, round) {
+  const r = requireRoom_(room);
+  const scenes = parseJson_(r.sceneAssetIdsJson, {});
+  const current = String(scenes[String(round)] || '');
+  if (isPreparedAssetId_(current)) return current;
+
+  const fileId = generateRoundSceneFile_(room, round);
+  scenes[String(round)] = fileId;
+  updateRoom_(room, {
+    sceneAssetIdsJson: JSON.stringify(scenes),
+    updatedAt: new Date().toISOString(),
+  });
+  return fileId;
+}
+
+
+function generateRoundSceneFile_(room, round) {
+  const r = requireRoom_(room);
+  const story = parseJson_(r.storyJson, null);
+  if (!story || !story.rounds || !story.rounds[round - 1]) throw new Error('No existe la ronda ' + round + '.');
+
+  const players = getPlayers_(room, true);
+  const rr = story.rounds[round - 1];
+  let ids = Array.isArray(rr.featuredPlayerIds) ? rr.featuredPlayerIds.slice(0, 4) : [];
+  if (round <= 2 && r.victimId && ids.indexOf(r.victimId) < 0) ids.unshift(r.victimId);
+  ids = unique_(ids).filter(id => players.some(p => p.playerId === id)).slice(0, 4);
+
+  const refs = ids.map(id => players.find(p => p.playerId === id)).filter(Boolean);
+  const blobs = refs.map(p => DriveApp.getFileById(p.avatarFileId).getBlob());
+  const refLegend = refs.map((p, i) => 'input image ' + i + ' is ' + p.name).join('; ');
+
+  const prompt = [
+    'Create a cinematic 16:9 still frame for a multiplayer murder mystery game, premium 3D comic / graphic-novel style.',
+    'Latin dramatic thriller atmosphere, expressive lighting, visual clues, elegant composition suitable for a TV.',
+    refLegend ? ('Character references: ' + refLegend + '. Preserve their recognizable avatar faces and design.') : '',
+    String(rr.imagePrompt || ''),
+    'No written words, no captions, no logos. No explicit gore. If a victim is shown, keep the scene tasteful and non-graphic.',
+  ].filter(Boolean).join(' ');
+
+  const blob = cloudflareImage_({
+    prompt,
+    width: QM.SCENE_WIDTH,
+    height: QM.SCENE_HEIGHT,
+    inputBlobs: blobs,
+  }).setName(room + '-scene-r' + round + '.png');
+
+  const file = saveAsset_(blob, room + '-scene-r' + round);
+  return file.getId();
+}
+
+function cloudflareImage_(opts) {
+  const cfg = getConfig_();
+  if (!cfg.cfToken) throw new Error('CLOUDFLARE_API_TOKEN no configurado.');
+  if (!cfg.cfAccountId) throw new Error('CLOUDFLARE_ACCOUNT_ID no configurado.');
+  opts = opts || {};
+  const model = cfg.cfImageModel;
+  const url = 'https://api.cloudflare.com/client/v4/accounts/' + encodeURIComponent(cfg.cfAccountId) + '/ai/run/' + model;
+  const payload = {
+    prompt: String(opts.prompt || '3D comic mystery illustration'),
+    width: String(opts.width || 512),
+    height: String(opts.height || 512),
+  };
+  (opts.inputBlobs || []).slice(0, 4).forEach((blob, i) => {
+    payload['input_image_' + i] = blob;
+  });
+
+  const res = fetchWithRetry_(url, {
+    method: 'post',
+    headers: { Authorization: 'Bearer ' + cfg.cfToken },
+    payload,
+    muteHttpExceptions: true,
+  }, 2);
+  assertHttp_(res, 'Cloudflare Workers AI');
+
+  const contentType = String((res.getHeaders()['Content-Type'] || res.getHeaders()['content-type'] || '')).toLowerCase();
+  if (contentType.indexOf('image/') === 0) return res.getBlob().setName('generated.png');
+
+  const text = res.getContentText();
+  let json;
+  try { json = JSON.parse(text); } catch (err) { throw new Error('Cloudflare devolvió una respuesta no JSON y no imagen.'); }
+  if (json.success === false) throw new Error('Cloudflare: ' + JSON.stringify(json.errors || json.messages || []).slice(0, 500));
+  let b64 = null;
+  if (json.result && typeof json.result.image === 'string') b64 = json.result.image;
+  else if (json.result && typeof json.result === 'string') b64 = json.result;
+  else if (json.image && typeof json.image === 'string') b64 = json.image;
+  if (!b64) throw new Error('Cloudflare no devolvió el campo de imagen esperado.');
+  b64 = b64.replace(/^data:image\/[^;]+;base64,/, '');
+  return Utilities.newBlob(Utilities.base64Decode(b64), 'image/png', 'generated.png');
+}
+
+// -----------------------------
+// Story validation / fallback
+// -----------------------------
+
+function normalizeRounds_(rounds, players, victim, killer) {
+  const ids = players.map(p => p.playerId);
+  const fallback = fallbackStory_(players, victim, killer).rounds;
+  if (!Array.isArray(rounds)) rounds = [];
+  const out = [];
+  for (let i = 0; i < QM.TOTAL_ROUNDS; i++) {
+    const src = rounds[i] || fallback[i];
+    const featured = unique_((src.featuredPlayerIds || []).map(String).filter(id => ids.indexOf(id) >= 0)).slice(0, 4);
+    if (!featured.length) featured.push(victim.playerId);
+    out.push({
+      n: i + 1,
+      title: String(src.title || fallback[i].title).slice(0, 100),
+      narration: String(src.narration || fallback[i].narration).slice(0, 1800),
+      publicClue: String(src.publicClue || fallback[i].publicClue).slice(0, 500),
+      evidenceTitle: String(src.evidenceTitle || fallback[i].evidenceTitle).slice(0, 120),
+      evidenceText: String(src.evidenceText || fallback[i].evidenceText).slice(0, 600),
+      imagePrompt: String(src.imagePrompt || fallback[i].imagePrompt).slice(0, 1300),
+      featuredPlayerIds: featured,
+    });
+  }
+  return out;
+}
+
+function normalizeSecrets_(secrets, players, victim, killer) {
+  secrets = Array.isArray(secrets) ? secrets : [];
+  return players.map(p => {
+    const s = secrets.find(x => String(x.playerId) === p.playerId) || {};
+    let role = p.playerId === killer.playerId ? 'KILLER' : (p.playerId === victim.playerId ? 'VICTIM' : 'SUSPECT');
+    let secret = String(s.secret || 'Ocultas un detalle de aquella noche que podría hacerte parecer culpable.').slice(0, 700);
+    let alibi = String(s.alibi || 'Tu coartada contiene un pequeño hueco de tiempo.').slice(0, 500);
+    if (role === 'VICTIM') {
+      secret = 'Eres la víctima de este caso, pero sigues jugando como investigador fantasma. Observa las pistas y vota al final.';
+      alibi = 'No necesitas defender una coartada: reconstruye lo que ocurrió.';
+    }
+    return { playerId: p.playerId, role, secret, alibi };
+  });
+}
+
+function fallbackStory_(players, victim, killer) {
+  const others = players.filter(p => p.playerId !== victim.playerId);
+  const s1 = others[0] || killer;
+  const s2 = others[1] || killer;
+  const s3 = others[2] || killer;
+  return {
+    caseTitle: 'El último brindis de ' + victim.name,
+    location: 'Una antigua casa de celebración a las afueras de la ciudad',
+    synopsis: 'Una reunión entre amigos termina con un secreto imposible de mantener enterrado.',
+    rounds: [
+      {
+        n: 1,
+        title: 'La invitación',
+        narration: 'Todo comenzó como una celebración privada. ' + victim.name + ' llegó con una noticia que prometía cambiar la vida de todos. Durante el brindis, una luz del pasillo parpadeó y alguien dejó un sobre sin remitente sobre la mesa. Dentro había una sola frase: “Esta noche se sabrá la verdad”. Nadie quiso admitir que reconocía la letra. Minutos después, ' + victim.name + ' se apartó del grupo para atender una llamada. Fue la última vez que todos pudieron asegurar haberle visto con vida.',
+        publicClue: 'El sobre fue colocado cuando casi todos estaban reunidos en la misma habitación.',
+        evidenceTitle: 'El sobre sin remitente',
+        evidenceText: 'Papel caro, perfume suave y una esquina arrancada deliberadamente.',
+        imagePrompt: 'A tense elegant gathering, the victim near a window, an anonymous envelope on a table, an indistinct shadow in the hallway.',
+        featuredPlayerIds: [victim.playerId, s1.playerId, s2.playerId].filter(Boolean),
+      },
+      {
+        n: 2,
+        title: 'Silencio en el pasillo',
+        narration: 'Un golpe seco interrumpió la música. Cuando fueron a buscar a ' + victim.name + ', la puerta de una habitación estaba entreabierta. No había señales de una lucha prolongada. El reloj de pared se había detenido exactamente siete minutos antes de que alguien diera la alarma. Cerca de la entrada apareció un botón oscuro que no pertenecía a la ropa de la víctima. Alguien insistió en que llevaba toda la noche en el salón, pero una fotografía tomada por accidente muestra una silueta cruzando el pasillo.',
+        publicClue: 'La hora real del crimen no coincide con la hora que todos recuerdan haber oído el golpe.',
+        evidenceTitle: 'El reloj detenido',
+        evidenceText: 'El mecanismo no estaba roto: alguien movió las agujas a mano.',
+        imagePrompt: 'Tasteful non-graphic crime scene, victim lying still partly in shadow, stopped wall clock, dark button on floor, investigators entering.',
+        featuredPlayerIds: [victim.playerId, s2.playerId, s3.playerId].filter(Boolean),
+      },
+      {
+        n: 3,
+        title: 'Los secretos salen a la luz',
+        narration: 'Las conversaciones privadas comienzan a contradecir las versiones públicas. Una deuda, una relación escondida y un documento firmado meses atrás conectan a varios asistentes con ' + victim.name + '. Sin embargo, una de esas revelaciones parece demasiado perfecta, como si hubiera sido preparada para ser descubierta. En el cubo de basura aparece la esquina que faltaba al sobre, pero está limpia, mientras el resto del papel tiene una mancha de bebida. Alguien manipuló la prueba después de escribir la amenaza.',
+        publicClue: 'La esquina del sobre apareció en un lugar donde la víctima nunca estuvo esa noche.',
+        evidenceTitle: 'La esquina arrancada',
+        evidenceText: 'Una fibra adherida coincide con la tela de una prenda usada por uno de los presentes.',
+        imagePrompt: 'Detective evidence table with torn envelope corner, fabric fiber under magnifier, suspicious guests in background, premium 3D comic style.',
+        featuredPlayerIds: [s1.playerId, killer.playerId, s3.playerId].filter(Boolean),
+      },
+      {
+        n: 4,
+        title: 'La contradicción',
+        narration: 'Al reconstruir los minutos previos, surge un dato imposible de ignorar. El culpable afirmó haber visto el reloj del pasillo marcar una hora concreta, pero ese reloj ya había sido manipulado y desde el salón no podía verse. Solo quien estuvo junto a la habitación de ' + victim.name + ' podía conocer esa posición de las agujas. La pista no demuestra por sí sola el motivo, pero destruye una coartada. Ahora cada palabra de aquella persona debe volver a examinarse.',
+        publicClue: 'Una persona describió un detalle del reloj que solo podía verse desde la escena.',
+        evidenceTitle: 'La frase imposible',
+        evidenceText: 'La declaración contiene información que nunca se hizo pública.',
+        imagePrompt: 'Dramatic interrogation scene, a suspect realizing a contradiction, stopped clock visible behind, other players watching, intense noir lighting.',
+        featuredPlayerIds: [killer.playerId, s1.playerId, s2.playerId].filter(Boolean),
+      },
+      {
+        n: 5,
+        title: 'La última pieza',
+        narration: 'La última evidencia no acusa a nadie directamente: una llave pequeña encontrada dentro del forro de un abrigo abre un compartimento donde ' + victim.name + ' guardaba copias de documentos comprometedores. Quien cometió el crimen no buscaba dinero; buscaba impedir que esa información saliera a la luz. El sobre, el reloj y la falsa coartada formaban parte del mismo intento de dirigir las sospechas hacia otros. Ya no queda nada más por descubrir. Es hora de decidir quién miente.',
+        publicClue: 'El motivo está relacionado con información que la víctima pensaba revelar esa misma noche.',
+        evidenceTitle: 'La llave escondida',
+        evidenceText: 'Abre el lugar donde estaba guardado el verdadero motivo del crimen.',
+        imagePrompt: 'Close-up of a small brass key, hidden compartment with documents, several suspects reflected in glass, cinematic 3D graphic-novel look.',
+        featuredPlayerIds: [killer.playerId, victim.playerId, s3.playerId].filter(Boolean),
+      },
+    ],
+    secrets: players.map((p, i) => ({
+      playerId: p.playerId,
+      role: p.playerId === killer.playerId ? 'KILLER' : (p.playerId === victim.playerId ? 'VICTIM' : 'SUSPECT'),
+      secret: p.playerId === killer.playerId
+        ? 'Temías que ' + victim.name + ' revelara un documento que podía destruir tu reputación. Debes defenderte sin confesar.'
+        : ('Ocultas una conversación privada con ' + victim.name + ' ocurrida antes de la reunión. Detalle ' + (i + 1) + '.'),
+      alibi: p.playerId === victim.playerId ? 'Juega como investigador fantasma.' : 'Afirmas haber estado con el grupo durante la mayor parte de la noche.',
+    })),
+    finalReveal: {
+      motive: killer.name + ' quería impedir que ' + victim.name + ' revelara unos documentos comprometedores.',
+      method: 'Manipuló la hora del reloj y preparó evidencias para crear una cronología falsa.',
+      explanation: 'La contradicción decisiva fue mencionar la posición exacta de las agujas de un reloj que solo podía verse desde la escena. La llave escondida confirmó el verdadero motivo.',
+      finalLine: 'Todos tenían un secreto. Solo uno necesitaba que la verdad muriera con la víctima.',
+    },
+  };
+}
+
+// -----------------------------
+// Database / Drive helpers
+// -----------------------------
+
+function setup_() {
+  const db = getDb_();
+  ensureSheet_(db, QM.SHEET_ROOMS, ROOM_HEADERS);
+  ensureSheet_(db, QM.SHEET_PLAYERS, PLAYER_HEADERS);
+  ensureSheet_(db, QM.SHEET_EVENTS, EVENT_HEADERS);
+  getAssetFolder_();
+}
+
+function getDb_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty(QM.PROP_DB_ID);
+  if (id) {
+    try { return SpreadsheetApp.openById(id); } catch (e) { props.deleteProperty(QM.PROP_DB_ID); }
+  }
+  let ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) {}
+  if (!ss) ss = SpreadsheetApp.create('QUIEN MATO - BD');
+  props.setProperty(QM.PROP_DB_ID, ss.getId());
+  return ss;
+}
+
+function getAssetFolder_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty(QM.PROP_ASSET_FOLDER);
+  if (id) {
+    try { return DriveApp.getFolderById(id); } catch (e) { props.deleteProperty(QM.PROP_ASSET_FOLDER); }
+  }
+  const folder = DriveApp.createFolder('QUIEN_MATO_ASSETS');
+  props.setProperty(QM.PROP_ASSET_FOLDER, folder.getId());
+  return folder;
+}
+
+function ensureSheet_(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  if (sh.getLastRow() === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  } else {
+    const existingWidth = Math.max(1, sh.getLastColumn());
+    const existing = sh.getRange(1, 1, 1, existingWidth).getValues()[0].map(String);
+    const expectedPrefix = headers.slice(0, Math.min(existing.length, headers.length));
+    const prefixOk = expectedPrefix.every((h, i) => existing[i] === h || existing[i] === '');
+    if (!prefixOk) throw new Error('La hoja ' + name + ' tiene una estructura incompatible. Haz una copia antes de migrarla.');
+    if (existing.length < headers.length) {
+      sh.getRange(1, existing.length + 1, 1, headers.length - existing.length).setValues([headers.slice(existing.length)]);
+    }
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+  sh.setFrozenRows(1);
+  return sh;
+}
+
+function getSheet_(name) { return getDb_().getSheetByName(name); }
+
+function getRowsAsObjects_(sheet, headers) {
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+  const values = sheet.getRange(2, 1, last - 1, headers.length).getValues();
+  return values.map((row, idx) => {
+    const o = { _row: idx + 2 };
+    headers.forEach((h, i) => o[h] = row[i]);
+    return o;
+  });
+}
+
+function appendObject_(sheet, headers, obj) {
+  sheet.appendRow(headers.map(h => obj[h] !== undefined ? obj[h] : ''));
+}
+
+function requireRoom_(room) {
+  room = normalizeRoom_(room);
+  const r = getRowsAsObjects_(getSheet_(QM.SHEET_ROOMS), ROOM_HEADERS)
+    .find(x => sameRoom_(x.room, room));
+  if (!r) throw new Error('Sala no encontrada.');
+  return r;
+}
+
+
+function requireHost_(room, hostKey) {
+  const r = requireRoom_(room);
+  if (!hostKey || String(r.hostKey) !== String(hostKey)) throw new Error('Acceso de anfitrión no válido.');
+  return r;
+}
+
+function updateRoom_(room, patch) {
+  const sh = getSheet_(QM.SHEET_ROOMS);
+  const r = requireRoom_(room);
+  const values = ROOM_HEADERS.map(h => patch[h] !== undefined ? patch[h] : r[h]);
+  sh.getRange(r._row, 1, 1, ROOM_HEADERS.length).setValues([values]);
+}
+
+function touchRoom_(room) { updateRoom_(room, { updatedAt: new Date().toISOString() }); }
+
+function getPlayers_(room, activeOnly) {
+  room = normalizeRoom_(room);
+  let list = getRowsAsObjects_(getSheet_(QM.SHEET_PLAYERS), PLAYER_HEADERS)
+    .filter(p => sameRoom_(p.room, room));
+  if (activeOnly) list = list.filter(p => truthy_(p.active));
+  return list;
+}
+
+function updatePlayer_(room, playerId, patch) {
+  room = normalizeRoom_(room);
+  const sh = getSheet_(QM.SHEET_PLAYERS);
+  const p = getRowsAsObjects_(sh, PLAYER_HEADERS).find(x => sameRoom_(x.room, room) && x.playerId === playerId);
+  if (!p) throw new Error('Jugador no encontrado.');
+  const values = PLAYER_HEADERS.map(h => patch[h] !== undefined ? patch[h] : p[h]);
+  sh.getRange(p._row, 1, 1, PLAYER_HEADERS.length).setValues([values]);
+}
+
+function applySecrets_(room, secrets) {
+  (secrets || []).forEach(s => updatePlayer_(room, s.playerId, { role: s.role, secret: s.secret, alibi: s.alibi, vote: '' }));
+}
+
+function clearVotes_(room) {
+  getPlayers_(room, true).forEach(p => updatePlayer_(room, p.playerId, { vote: '' }));
+}
+
+function countVotes_(players) {
+  const counts = {};
+  players.forEach(p => { if (p.vote) counts[p.vote] = (counts[p.vote] || 0) + 1; });
+  return counts;
+}
+
+
+function rosterSignature_(players) {
+  return (players || [])
+    .filter(p => truthy_(p.active))
+    .map(p => String(p.playerId || '') + ':' + String(p.avatarFileId || ''))
+    .sort()
+    .join('|');
+}
+
+function isPreparedAssetId_(value) {
+  value = String(value || '');
+  return !!value && value.indexOf('__GEN__') !== 0;
+}
+
+function countPreparedScenes_(scenes) {
+  scenes = scenes || {};
+  let count = 0;
+  for (let i = 1; i <= QM.TOTAL_ROUNDS; i++) {
+    if (isPreparedAssetId_(String(scenes[String(i)] || ''))) count++;
+  }
+  return count;
+}
+
+function invalidatePreparedCase_(room, reason) {
+  updateRoom_(room, {
+    victimId: '',
+    killerId: '',
+    storyJson: '',
+    sceneAssetIdsJson: '{}',
+    audioAssetIdsJson: '{}',
+    resultJson: '',
+    caseRosterSignature: '',
+    casePrepStatus: 'PENDING',
+    casePrepError: '',
+    updatedAt: new Date().toISOString(),
+  });
+  logEvent_(room, 'CASE_INVALIDATED', { reason: String(reason || '') });
+}
+
+function saveAsset_(blob, baseName) {
+  const folder = getAssetFolder_();
+  const ext = extensionForMime_(blob.getContentType());
+  blob.setName(cleanFileName_(baseName) + ext);
+  return folder.createFile(blob);
+}
+
+function isGameAsset_(file) {
+  const folderId = getAssetFolder_().getId();
+  const parents = file.getParents();
+  while (parents.hasNext()) if (parents.next().getId() === folderId) return true;
+  return false;
+}
+
+function logEvent_(room, type, data) {
+  try {
+    appendObject_(getSheet_(QM.SHEET_EVENTS), EVENT_HEADERS, {
+      timestamp: new Date().toISOString(), room, type, dataJson: JSON.stringify(data || {}),
+    });
+  } catch (e) {}
+}
+
+// -----------------------------
+// Utility helpers
+// -----------------------------
+
+function getConfig_() {
+  const p = PropertiesService.getScriptProperties();
+  return {
+    geminiKey: p.getProperty('GEMINI_API_KEY') || '',
+    cfToken: p.getProperty('CLOUDFLARE_API_TOKEN') || '',
+    cfAccountId: p.getProperty('CLOUDFLARE_ACCOUNT_ID') || '',
+    geminiTextModel: p.getProperty('GEMINI_TEXT_MODEL') || QM.GEMINI_TEXT_MODEL,
+    geminiTtsModel: p.getProperty('GEMINI_TTS_MODEL') || QM.GEMINI_TTS_MODEL,
+    cfImageModel: p.getProperty('CF_IMAGE_MODEL') || QM.CF_IMAGE_MODEL,
+  };
+}
+
+function roomLinks_(room, hostKey) {
+  const base = getAppUrl_();
+  const hostUrl = base + '?view=host&room=' + encodeURIComponent(room) + '&hostKey=' + encodeURIComponent(hostKey);
+  return {
+    room,
+    hostKey,
+    hostUrl,
+    setupUrl: hostUrl,
+    joinUrl: base + '?view=join&room=' + encodeURIComponent(room),
+    screenUrl: base + '?view=screen&room=' + encodeURIComponent(room) + '&hostKey=' + encodeURIComponent(hostKey),
+  };
+}
+
+function getAppUrl_() {
+  try { return ScriptApp.getService().getUrl() || ''; } catch (e) { return ''; }
+}
+
+function uniqueRoom_() {
+  const used = new Set(getRowsAsObjects_(getSheet_(QM.SHEET_ROOMS), ROOM_HEADERS).map(r => String(r.room)));
+  for (let i = 0; i < 50; i++) {
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    if (!used.has(code)) return code;
+  }
+  throw new Error('No se pudo generar un código de sala.');
+}
+
+function randomToken_(len) {
+  return Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '').slice(0, Math.max(0, len - 32));
+}
+
+function cleanName_(s) {
+  s = String(s || '').replace(/[<>]/g, '').replace(/\s+/g, ' ').trim();
+  if (s.length < 1) throw new Error('Nombre no válido.');
+  return s.slice(0, 28);
+}
+
+function cleanFileName_(s) { return String(s || 'asset').replace(/[^a-zA-Z0-9áéíóúÁÉÍÓÚñÑ_-]+/g, '-').slice(0, 70); }
+function normalizeRoom_(s) { return String(s || '').replace(/\D/g, '').slice(0, 6); }
+function sameRoom_(a, b) { return normalizeRoom_(a) === normalizeRoom_(b); }
+function normalizeText_(s) { return String(s || '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, ''); }
+function truthy_(v) { return v === true || v === 1 || String(v).toLowerCase() === 'true'; }
+function parseJson_(s, fallback) { try { return s ? JSON.parse(String(s)) : fallback; } catch (e) { return fallback; } }
+function unique_(arr) { return Array.from(new Set(arr || [])); }
+function shuffle_(arr) { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
+function safeError_(err) { return String(err && (err.message || err) || 'Error desconocido').slice(0, 800); }
+
+function sanitizeRound_(r) {
+  if (!r) return null;
+  return {
+    n: Number(r.n || 0),
+    title: String(r.title || ''),
+    narration: String(r.narration || ''),
+    publicClue: String(r.publicClue || ''),
+    evidenceTitle: String(r.evidenceTitle || ''),
+    evidenceText: String(r.evidenceText || ''),
+  };
+}
+
+
+function normalizeGeminiSchema_(value) {
+  if (Array.isArray(value)) return value.map(normalizeGeminiSchema_);
+  if (!value || typeof value !== 'object') return value;
+  const out = {};
+  Object.keys(value).forEach(k => {
+    let v = value[k];
+    if (k === 'type' && typeof v === 'string') v = v.toUpperCase();
+    out[k] = normalizeGeminiSchema_(v);
+  });
+  return out;
+}
+
+function dataUrlToBlob_(dataUrl, filename) {
+  const m = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/);
+  if (!m) throw new Error('Formato de imagen no válido.');
+  const mime = m[1];
+  if (!/^image\/(jpeg|jpg|png|webp)$/i.test(mime)) throw new Error('Tipo de imagen no admitido.');
+  return Utilities.newBlob(Utilities.base64Decode(m[2]), mime, filename || 'photo.jpg');
+}
+
+function extensionForMime_(mime) {
+  mime = String(mime || '').toLowerCase();
+  if (mime.indexOf('png') >= 0) return '.png';
+  if (mime.indexOf('wav') >= 0) return '.wav';
+  if (mime.indexOf('mpeg') >= 0 || mime.indexOf('mp3') >= 0) return '.mp3';
+  if (mime.indexOf('webp') >= 0) return '.webp';
+  return '.jpg';
+}
+
+function fetchWithRetry_(url, options, retries) {
+  let last;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = UrlFetchApp.fetch(url, options);
+      const code = res.getResponseCode();
+      if (code !== 429 && code < 500) return res;
+      last = new Error('HTTP ' + code + ': ' + res.getContentText().slice(0, 500));
+    } catch (err) { last = err; }
+    if (i < retries) Utilities.sleep(1200 * (i + 1));
+  }
+  throw last || new Error('Error de red.');
+}
+
+function assertHttp_(res, label) {
+  const code = res.getResponseCode();
+  if (code >= 200 && code < 300) return;
+  let body = '';
+  try { body = res.getContentText().slice(0, 1000); } catch (e) {}
+  throw new Error(label + ' HTTP ' + code + ': ' + body);
+}
+
+function pcmToWavBlob_(pcmBytes, sampleRate, channels, bitsPerSample, filename) {
+  const dataLen = pcmBytes.length;
+  const byteRate = sampleRate * channels * bitsPerSample / 8;
+  const blockAlign = channels * bitsPerSample / 8;
+  let h = [];
+  h = h.concat(asciiBytes_('RIFF'));
+  h = h.concat(le32_(36 + dataLen));
+  h = h.concat(asciiBytes_('WAVE'));
+  h = h.concat(asciiBytes_('fmt '));
+  h = h.concat(le32_(16));
+  h = h.concat(le16_(1));
+  h = h.concat(le16_(channels));
+  h = h.concat(le32_(sampleRate));
+  h = h.concat(le32_(byteRate));
+  h = h.concat(le16_(blockAlign));
+  h = h.concat(le16_(bitsPerSample));
+  h = h.concat(asciiBytes_('data'));
+  h = h.concat(le32_(dataLen));
+  const all = h.map(toSignedByte_).concat(pcmBytes);
+  return Utilities.newBlob(all, 'audio/wav', filename || 'audio.wav');
+}
+
+function asciiBytes_(s) { return String(s).split('').map(c => c.charCodeAt(0)); }
+function le16_(n) { return [n & 255, (n >>> 8) & 255]; }
+function le32_(n) { return [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]; }
+function toSignedByte_(n) { n = n & 255; return n > 127 ? n - 256 : n; }
