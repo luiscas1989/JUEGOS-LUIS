@@ -16,8 +16,8 @@
  */
 
 const QM = Object.freeze({
-  VERSION: '1.2.1',
-  MIN_PLAYERS: 4,
+  VERSION: '1.3.0',
+  MIN_PLAYERS: 2,
   MAX_PLAYERS: 12,
   TOTAL_ROUNDS: 5,
   ROOM_TTL_HOURS: 12,
@@ -163,11 +163,18 @@ function apiCreateRoom(hostName) {
   try {
     const room = uniqueRoom_();
     const hostKey = randomToken_(24);
+    const defaultConfig = normalizeGameConfig_({
+      storyStyle: 'La Mujer de Judas',
+      location: 'Aleatoria',
+      mood: 'Telenovela de misterio',
+    });
     appendObject_(getSheet_(QM.SHEET_ROOMS), ROOM_HEADERS, {
       room,
       hostKey,
       hostName,
-      status: 'SETUP',
+      // Nuevo flujo: primero se crea el perfil del anfitrión. La configuración
+      // del caso se hace después, directamente desde el panel de sala.
+      status: 'HOST_PROFILE',
       round: 0,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -177,7 +184,7 @@ function apiCreateRoom(hostName) {
       sceneAssetIdsJson: '{}',
       audioAssetIdsJson: '{}',
       resultJson: '',
-      configJson: '{}',
+      configJson: JSON.stringify(defaultConfig),
       blueprintJson: '',
       prepStatus: 'IDLE',
       prepError: '',
@@ -185,8 +192,7 @@ function apiCreateRoom(hostName) {
       casePrepStatus: 'IDLE',
       casePrepError: '',
     });
-    logEvent_(room, 'ROOM_CREATED', { hostName, phase: 'SETUP' });
-    // Fuerza la escritura antes de redirigir a Ver partida/anfitrión.
+    logEvent_(room, 'ROOM_CREATED', { hostName, phase: 'HOST_PROFILE' });
     SpreadsheetApp.flush();
     return roomLinks_(room, hostKey);
   } finally {
@@ -200,7 +206,7 @@ function apiCreateRoom(hostName) {
  * anfitrión no tenga que esperar a Gemini antes de mostrar el QR.
  */
 
-function apiFinalizeSetup(room, hostKey, config) {
+function apiSaveConfig(room, hostKey, config) {
   setup_();
   room = normalizeRoom_(room);
   const clean = normalizeGameConfig_(config || {});
@@ -208,24 +214,45 @@ function apiFinalizeSetup(room, hostKey, config) {
   lock.waitLock(15000);
   try {
     const r = requireHost_(room, hostKey);
-    if (r.status !== 'SETUP') throw new Error('La configuración de esta sala ya fue finalizada.');
-    updateRoom_(room, {
-      hostName: '',
-      status: 'HOST_PROFILE',
+    if (['HOST_PROFILE','WAITING'].indexOf(String(r.status)) < 0) {
+      throw new Error('La configuración solo puede cambiarse antes de iniciar la partida.');
+    }
+    const previous = normalizeGameConfig_(parseJson_(r.configJson, {}));
+    const changed = JSON.stringify(previous) !== JSON.stringify(clean);
+    const patch = {
       configJson: JSON.stringify(clean),
-      blueprintJson: '',
-      prepStatus: 'PENDING',
-      prepError: '',
-      caseRosterSignature: '',
-      casePrepStatus: 'IDLE',
-      casePrepError: '',
       updatedAt: new Date().toISOString(),
-    });
-    logEvent_(room, 'SETUP_FINALIZED', { config: clean, next: 'HOST_PROFILE' });
-    return { ok: true, room, status: 'HOST_PROFILE', prepStatus: 'PENDING' };
+    };
+    // Si realmente cambió la configuración, invalida cualquier intento previo.
+    // Si es igual, conserva guion/escenas para poder reintentar una imagen fallida.
+    if (changed) {
+      Object.assign(patch, {
+        blueprintJson: '',
+        prepStatus: 'IDLE',
+        prepError: '',
+        storyJson: '',
+        victimId: '',
+        killerId: '',
+        sceneAssetIdsJson: '{}',
+        audioAssetIdsJson: '{}',
+        resultJson: '',
+        caseRosterSignature: '',
+        casePrepStatus: 'IDLE',
+        casePrepError: '',
+      });
+    }
+    updateRoom_(room, patch);
+    logEvent_(room, 'CONFIG_SAVED', { config: clean, changed });
+    SpreadsheetApp.flush();
+    return { ok: true, room, status: r.status, config: clean };
   } finally {
     lock.releaseLock();
   }
+}
+
+// Alias para despliegues o enlaces antiguos.
+function apiFinalizeSetup(room, hostKey, config) {
+  return apiSaveConfig(room, hostKey, config);
 }
 
 /**
@@ -536,7 +563,9 @@ function apiGetState(room, auth) {
     privatePlayer,
     isHost,
     links: isHost ? roomLinks_(room, r.hostKey) : null,
-    canStart: isHost && r.status === 'WAITING' && players.length >= QM.MIN_PLAYERS && avatarsReady && blueprintReady && casePrepared && (scenesPrepared >= 1 || !!String(r.casePrepError || '')),
+    // Se puede iniciar con cualquier reparto de 2 a 12 jugadores. La historia y las
+    // imágenes se generan AL pulsar iniciar, no durante la sala de espera.
+    canStart: isHost && r.status === 'WAITING' && players.length >= QM.MIN_PLAYERS && avatarsReady,
     minPlayers: QM.MIN_PLAYERS,
     maxPlayers: QM.MAX_PLAYERS,
     avatarsReady,
@@ -754,79 +783,190 @@ function apiStart(room, hostKey) {
   setup_();
   room = normalizeRoom_(room);
 
-  let needFirstScene = false;
+  let players = [];
+  let signature = '';
+  let config = {};
+  let victim = null;
+  let killer = null;
+  let story = null;
+  let storyMode = 'GEMINI';
+  let storyWarning = '';
 
+  // Primer paso del arranque: congela el reparto y crea el guion. Las imágenes
+  // se generan en llamadas separadas para evitar el límite de ejecución de Apps Script.
   const lock = LockService.getScriptLock();
   lock.waitLock(30000);
   try {
     const r = requireHost_(room, hostKey);
-    if (r.status !== 'WAITING') throw new Error('La sala todavía no está lista para iniciar.');
-
-    const players = getPlayers_(room, true);
-    if (players.length < QM.MIN_PLAYERS) throw new Error('Se necesitan al menos ' + QM.MIN_PLAYERS + ' jugadores.');
-    if (players.some(p => !p.avatarFileId || String(p.avatarStatus || '') === 'PROCESSING')) {
-      throw new Error('Todavía hay caricaturas procesándose. Espera unos segundos.');
+    if (r.status !== 'WAITING') {
+      if (r.status === 'GENERATING') throw new Error('La historia ya se está generando. Espera unos instantes.');
+      throw new Error('La sala todavía no está lista para iniciar.');
     }
 
-    const signature = rosterSignature_(players);
-    let story = parseJson_(r.storyJson, null);
-    let victim = players.find(p => p.playerId === String(r.victimId || ''));
-    let killer = players.find(p => p.playerId === String(r.killerId || ''));
-    const preparedForThisCast = story && victim && killer && String(r.caseRosterSignature || '') === signature;
+    players = getPlayers_(room, true);
+    if (players.length < QM.MIN_PLAYERS) throw new Error('Se necesitan al menos ' + QM.MIN_PLAYERS + ' jugadores.');
+    if (players.some(p => !p.avatarFileId || String(p.avatarStatus || '') === 'PROCESSING')) {
+      throw new Error('Todavía hay caricaturas procesándose. Espera a que terminen.');
+    }
 
-    if (!preparedForThisCast) {
-      let blueprint = parseJson_(r.blueprintJson, null);
-      const config = parseJson_(r.configJson, {});
-      if (!blueprint) {
-        blueprint = fallbackBlueprint_(config);
-        logEvent_(room, 'BLUEPRINT_MISSING_FALLBACK', {});
-      }
+    signature = rosterSignature_(players);
+    config = normalizeGameConfig_(parseJson_(r.configJson, {}));
+    const existingStory = parseJson_(r.storyJson, null);
+    const existingVictim = players.find(p => p.playerId === String(r.victimId || ''));
+    const existingKiller = players.find(p => p.playerId === String(r.killerId || ''));
+    const sameCast = String(r.caseRosterSignature || '') === signature;
+
+    if (sameCast && existingStory && existingVictim && existingKiller) {
+      story = existingStory;
+      victim = existingVictim;
+      killer = existingKiller;
+      storyMode = 'CACHED';
+    } else {
       const shuffled = shuffle_(players.slice());
       victim = shuffled[0];
       killer = shuffled[1];
-      story = materializeStory_(blueprint, players, victim, killer);
-      updateRoom_(room, {
-        victimId: victim.playerId,
-        killerId: killer.playerId,
-        storyJson: JSON.stringify(story),
-        sceneAssetIdsJson: '{}',
-        caseRosterSignature: signature,
-        casePrepStatus: 'SCENES',
-        casePrepError: '',
-      });
+      story = null;
     }
 
-    const latest = requireRoom_(room);
-    const scenes = parseJson_(latest.sceneAssetIdsJson, {});
-    needFirstScene = !isPreparedAssetId_(String(scenes['1'] || ''));
-
     updateRoom_(room, {
-      status: 'ROUND',
-      round: 1,
-      audioAssetIdsJson: '{}',
-      resultJson: '',
-      updatedAt: new Date().toISOString(),
-    });
-
-    applySecrets_(room, story.secrets);
-    clearVotes_(room);
-    logEvent_(room, 'GAME_STARTED', {
+      status: 'GENERATING',
+      round: 0,
       victimId: victim.playerId,
       killerId: killer.playerId,
-      storyMode: preparedForThisCast ? 'PRELOADED' : 'ON_START',
+      storyJson: story ? JSON.stringify(story) : '',
+      sceneAssetIdsJson: sameCast ? String(r.sceneAssetIdsJson || '{}') : '{}',
+      audioAssetIdsJson: '{}',
+      resultJson: '',
+      blueprintJson: story ? String(r.blueprintJson || '') : '',
+      prepStatus: story ? 'READY' : 'GENERATING',
+      prepError: '',
+      caseRosterSignature: signature,
+      casePrepStatus: 'GENERATING',
+      casePrepError: '',
+      updatedAt: new Date().toISOString(),
     });
+    logEvent_(room, 'GAME_GENERATION_STARTED', { rosterSize: players.length, victimId: victim.playerId, killerId: killer.playerId, reusedStory: !!story });
+    SpreadsheetApp.flush();
   } finally {
     lock.releaseLock();
   }
 
-  let assetWarning = '';
-  if (needFirstScene) {
-    try { ensureRoundScene_(room, 1); } catch (err) {
-      assetWarning = safeError_(err);
-      logEvent_(room, 'SCENE_ERROR', { round: 1, error: assetWarning });
+  if (!story) {
+    let blueprint;
+    try {
+      blueprint = generateBlueprint_(room, config, players, victim, killer);
+    } catch (err) {
+      storyMode = 'LOCAL_FALLBACK';
+      storyWarning = 'Gemini no pudo generar el guion; se utilizó el respaldo local: ' + safeError_(err);
+      blueprint = fallbackBlueprint_(config);
+      logEvent_(room, 'STORY_GEMINI_FALLBACK', { error: safeError_(err) });
     }
+    blueprint = normalizeBlueprint_(blueprint, config);
+    story = materializeStory_(blueprint, players, victim, killer);
+    updateRoom_(room, {
+      blueprintJson: JSON.stringify(blueprint),
+      storyJson: JSON.stringify(story),
+      prepStatus: 'READY',
+      prepError: storyWarning,
+      updatedAt: new Date().toISOString(),
+    });
+    SpreadsheetApp.flush();
   }
-  return { ok: true, room, round: 1, warning: assetWarning };
+
+  const r2 = requireRoom_(room);
+  const scenes = parseJson_(r2.sceneAssetIdsJson, {});
+  return {
+    ok: true,
+    room,
+    stage: 'STORY_READY',
+    storyMode,
+    warning: storyWarning,
+    scenesPrepared: countPreparedScenes_(scenes),
+    totalRounds: QM.TOTAL_ROUNDS,
+  };
+}
+
+function apiGenerateStartScene(room, hostKey, round) {
+  setup_();
+  room = normalizeRoom_(room);
+  round = Number(round || 0);
+  if (round < 1 || round > QM.TOTAL_ROUNDS) throw new Error('Ronda de imagen no válida.');
+
+  const r = requireHost_(room, hostKey);
+  if (r.status !== 'GENERATING') throw new Error('La sala no está generando la partida.');
+  if (!String(r.storyJson || '').trim()) throw new Error('El guion todavía no está listo.');
+
+  const scenes = parseJson_(r.sceneAssetIdsJson, {});
+  const existing = String(scenes[String(round)] || '');
+  if (isPreparedAssetId_(existing)) {
+    return { ok: true, cached: true, round, fileId: existing, scenesPrepared: countPreparedScenes_(scenes), totalRounds: QM.TOTAL_ROUNDS };
+  }
+
+  let fileId = '';
+  try {
+    fileId = generateRoundSceneFile_(room, round);
+  } catch (err) {
+    const msg = safeError_(err);
+    updateRoom_(room, { casePrepStatus: 'ERROR', casePrepError: msg, updatedAt: new Date().toISOString() });
+    logEvent_(room, 'START_SCENE_ERROR', { round, error: msg });
+    throw new Error('No se pudo generar la imagen de la ronda ' + round + ': ' + msg);
+  }
+
+  const latest = requireRoom_(room);
+  const latestScenes = parseJson_(latest.sceneAssetIdsJson, {});
+  latestScenes[String(round)] = fileId;
+  const count = countPreparedScenes_(latestScenes);
+  updateRoom_(room, {
+    sceneAssetIdsJson: JSON.stringify(latestScenes),
+    casePrepStatus: count >= QM.TOTAL_ROUNDS ? 'READY' : 'GENERATING',
+    casePrepError: '',
+    updatedAt: new Date().toISOString(),
+  });
+  SpreadsheetApp.flush();
+  logEvent_(room, 'START_SCENE_READY', { round, fileId, scenesPrepared: count });
+  return { ok: true, cached: false, round, fileId, scenesPrepared: count, totalRounds: QM.TOTAL_ROUNDS };
+}
+
+function apiFinishStart(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const r = requireHost_(room, hostKey);
+    if (r.status !== 'GENERATING') throw new Error('La sala no está en proceso de inicio.');
+    const story = parseJson_(r.storyJson, null);
+    if (!story || !Array.isArray(story.rounds) || story.rounds.length !== QM.TOTAL_ROUNDS) throw new Error('El guion no está completo.');
+    const scenes = parseJson_(r.sceneAssetIdsJson, {});
+    if (countPreparedScenes_(scenes) < QM.TOTAL_ROUNDS) throw new Error('Todavía faltan imágenes por generar.');
+
+    applySecrets_(room, story.secrets);
+    clearVotes_(room);
+    updateRoom_(room, {
+      status: 'ROUND',
+      round: 1,
+      prepStatus: 'READY',
+      casePrepStatus: 'READY',
+      casePrepError: '',
+      updatedAt: new Date().toISOString(),
+    });
+    logEvent_(room, 'GAME_STARTED', { victimId: r.victimId, killerId: r.killerId, scenesPrepared: QM.TOTAL_ROUNDS });
+    SpreadsheetApp.flush();
+    return { ok: true, room, round: 1 };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function apiCancelGeneration(room, hostKey) {
+  setup_();
+  room = normalizeRoom_(room);
+  const r = requireHost_(room, hostKey);
+  if (r.status === 'GENERATING') {
+    updateRoom_(room, { status: 'WAITING', casePrepStatus: 'ERROR', updatedAt: new Date().toISOString() });
+    SpreadsheetApp.flush();
+  }
+  return { ok: true };
 }
 
 function apiWarmScene(room, hostKey, round) {
@@ -984,14 +1124,20 @@ function apiCloseRoom(room, hostKey) {
 // AI: Gemini story + TTS
 // -----------------------------
 
-function generateBlueprint_(room, config) {
+function generateBlueprint_(room, config, players, victim, killer) {
   config = normalizeGameConfig_(config || {});
+  players = Array.isArray(players) ? players : [];
+  const castNames = players.map(p => p.name).filter(Boolean);
   const prompt = [
     'Eres guionista senior de un party game social llamado “¿Quién mató a [jugador]?”.',
-    'Crea un CASO BASE completamente original con sabor a thriller de telenovela venezolana: secretos, traiciones, dinero, celos, alianzas, pistas falsas y un giro lógico.',
+    'Crea un caso COMPLETAMENTE ORIGINAL con sabor a thriller de telenovela venezolana: secretos, traiciones, dinero, celos, alianzas, pistas falsas y un giro lógico.',
     'No copies ninguna novela, personaje, escena ni diálogo existente.',
-    'El caso se prepara ANTES de saber quiénes serán los jugadores. Usa el marcador [VICTIM] para la futura víctima y [KILLER] SOLO dentro de finalReveal.',
-    'Nunca uses [KILLER] en las narraciones, pistas, evidencias ni prompts visuales de las rondas.',
+    'REPARTO REAL DE ESTA PARTIDA: ' + JSON.stringify(castNames) + '.',
+    'La víctima elegida internamente es [VICTIM] = ' + JSON.stringify(victim ? victim.name : '') + '.',
+    'El asesino elegido internamente es [KILLER] = ' + JSON.stringify(killer ? killer.name : '') + '.',
+    'Usa [VICTIM] en las rondas cuando hables de la víctima. Usa [KILLER] SOLO en finalReveal para no revelar al culpable antes de tiempo.',
+    'En las rondas puedes mencionar por su nombre a los demás jugadores como sospechosos y repartir presencia entre todo el reparto.',
+    'Nunca digas ni insinúes de forma inequívoca que [KILLER] es culpable antes del final. Las pistas deben permitir deducirlo solo al combinarse.',
     'Debe ser elegante, misterioso y apto para reunión de amigos, sin gore ni violencia gráfica.',
     'Configuración elegida por el anfitrión: ' + JSON.stringify(config),
     config.storyStyle === 'La Mujer de Judas'
@@ -1001,6 +1147,7 @@ function generateBlueprint_(room, config) {
     'Las pistas de rondas 2–5 deben permitir deducir la solución al final mediante una contradicción concreta.',
     'La primera ronda presenta el lugar, a [VICTIM] y una amenaza o detalle inquietante. La segunda descubre el crimen de forma no gráfica.',
     'En finalReveal sí puedes usar [KILLER] y [VICTIM].',
+    'Haz que el caso se sienta escrito específicamente para este reparto, no como una plantilla genérica.',
     'Sala interna: ' + room,
   ].join('\n');
 
