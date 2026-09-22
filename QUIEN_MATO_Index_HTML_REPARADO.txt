@@ -91,14 +91,14 @@
         <div class="homeKicker">Misterio multijugador · cómic 3D</div>
         <h1>¿Quién <span class="red">mató</span><br>a...?</h1>
         <p class="lead">Vuestras fotos se convierten en personajes. La víctima será uno de vosotros y cada ronda revelará una nueva prueba.</p>
-        <div class="micro"><span>4–12 jugadores</span><span>5 rondas</span><span>QR</span><span>Ver partida</span><span>IA</span></div>
+        <div class="micro"><span>2–12 jugadores</span><span>5 rondas</span><span>QR</span><span>Ver partida</span><span>IA</span></div>
       </section>
       <section class="homeMenu">
         <div class="homeTitle"><h3>¿Qué quieres hacer?</h3><div class="muted">Todo empieza desde aquí.</div></div>
         <div class="homeActions">
-          <button class="homeAction primaryCard" onclick="createScreenRoom()"><span class="ico">📺</span><strong>Ver partida</strong><small>La TV crea la sala. Primero entra el anfitrión, termina la configuración y después aparece el QR para los jugadores.</small><span class="arrow">›</span></button>
-          <button class="homeAction" onclick="createHostRoom()"><span class="ico">🎛️</span><strong>Crear partida</strong><small>Crea y configura la sala desde el móvil. Después abre Ver partida para usar la TV como centro del juego.</small><span class="arrow">›</span></button>
-          <button class="homeAction" onclick="openJoinModal()"><span class="ico">🔎</span><strong>Unirse a partida</strong><small>Introduce el código de sala, sube tu foto y la IA preparará tu personaje mientras esperas.</small><span class="arrow">›</span></button>
+          <button class="homeAction primaryCard" onclick="createScreenRoom()"><span class="ico">📺</span><strong>Ver partida</strong><small>La TV crea la sala. Primero el anfitrión crea su perfil; después esta misma pantalla se convierte en el panel central con configuración, QR y jugadores.</small><span class="arrow">›</span></button>
+          <button class="homeAction" onclick="createHostRoom()"><span class="ico">🎛️</span><strong>Crear partida</strong><small>Crea la sala desde el móvil, configura tu perfil y usa el panel para elegir el caso, compartir el QR e iniciar cuando quieras.</small><span class="arrow">›</span></button>
+          <button class="homeAction" onclick="openJoinModal()"><span class="ico">🔎</span><strong>Unirse a partida</strong><small>Introduce el código, tu nombre y una foto. La IA convierte tu foto en caricatura al entrar.</small><span class="arrow">›</span></button>
         </div>
       </section>
     </div></main>`;
@@ -145,11 +145,11 @@ async function checkJoinGate(room){
         const s=await call('apiGetState',room,{});
         const gate=$('joinGate');if(!gate)return;
         if(s.status==='SETUP'){
-          gate.innerHTML=`<div style="text-align:center"><div class="waitingText">PASO 1</div><h2>El anfitrión está configurando</h2><p class="muted">En cuanto guarde la configuración continuará con su perfil.</p><span class="spinner"></span></div>`;
+          gate.innerHTML=`<div style="text-align:center"><div class="waitingText">PREPARANDO SALA</div><h2>El anfitrión está entrando</h2><p class="muted">En cuanto cree su perfil aparecerá el acceso para jugadores.</p><span class="spinner"></span></div>`;
           return;
         }
         if(s.status==='HOST_PROFILE'){
-          gate.innerHTML=`<div style="text-align:center"><div class="waitingText">PASO 2</div><h2>El anfitrión está creando su personaje</h2><p class="muted">El QR general se habilitará cuando termine su nombre, foto y caricatura.</p><span class="spinner"></span></div>`;
+          gate.innerHTML=`<div style="text-align:center"><div class="waitingText">ANFITRIÓN</div><h2>El anfitrión está creando su perfil</h2><p class="muted">Cuando su caricatura esté lista, esta sala se abrirá para todos.</p><span class="spinner"></span></div>`;
           return;
         }
         if(s.status==='WAITING'){
@@ -189,13 +189,6 @@ async function refresh(room,mode){
       STATE=await call('apiGetState',room,auth);
       await hydrateStateAssets(STATE);
       if(mode==='host')renderHost(STATE);else if(mode==='screen')renderScreen(STATE);else renderPlayer(STATE);
-
-      if((mode==='host'||mode==='screen')&&['HOST_PROFILE','WAITING'].includes(STATE.status)&&STATE.prepStatus==='PENDING'){
-        warmStory(STATE);
-      }
-      if((mode==='host'||mode==='screen')&&STATE.status==='WAITING'){
-        warmCase(STATE);
-      }
     }catch(e){toast(e.message,'error',7000)}
   }
 
@@ -213,57 +206,26 @@ async function refresh(room,mode){
   
 function renderHost(s){
     const b=$('hostBody');if(!b)return;const L=s.links||{};
-    if(s.status==='SETUP'&&b.dataset.phase==='SETUP')return;
-    if(s.status==='HOST_PROFILE'&&b.dataset.phase==='HOST_PROFILE')return;
-    b.dataset.phase=s.status;
     if(s.status==='CLOSED'){
       b.innerHTML=`<h2>Sala cerrada</h2><button class="btn primary" onclick="location.href=baseUrl()">Volver</button>`;
       return;
     }
 
+    // Compatibilidad con salas antiguas: saltar directamente al perfil.
     if(s.status==='SETUP'){
-      const cfg=s.config||{};
-      b.innerHTML=`<div class="stageGrid">
-        <div>
-          <div class="phase"><span class="phaseNum">1</span><div><strong>Paso 1 · Configurar la sala</strong><div class="muted" style="font-size:12px">Aquí solo se define el caso. Todavía no se pide nombre ni foto.</div></div></div>
-          <div class="room-code" style="font-size:46px">${s.room}</div>
-          <p class="muted">Guarda primero los datos del caso. Después pasarás automáticamente a crear tu perfil como primer jugador.</p>
-          <div class="actions"><button class="btn ghost" onclick="window.open('${escAttr(L.screenUrl||'')}','_blank')">📺 Abrir Ver partida</button><button class="btn danger" onclick="closeRoom('${s.room}')">Cerrar sala</button></div>
-        </div>
-        <div>
-          <label>Tipo de historia</label>
-          <select id="cfgStoryStyle">
-            <option>La Mujer de Judas</option>
-            <option>Caso original</option>
-            <option>Novia enmascarada</option>
-            <option>Secretos de familia</option>
-          </select>
-          <div class="configGrid">
-            <div><label>Escenario</label><select id="cfgLocation"><option>Aleatoria</option><option>Tren nocturno</option><option>Mansión aislada</option><option>Hotel elegante</option><option>Fiesta privada</option><option>Pueblo venezolano</option><option>Casa de campo</option></select></div>
-            <div><label>Tono</label><select id="cfgMood"><option>Telenovela de misterio</option><option>Dramático</option><option>Oscuro</option><option>Intriga elegante</option></select></div>
-          </div>
-          <div class="status" style="margin-top:14px">5 rondas · víctima aleatoria · asesino aleatorio · cómic 3D</div>
-          <button class="btn primary big" style="width:100%;margin-top:14px" onclick="finalizeSetup('${s.room}')">Guardar configuración</button>
-        </div>
-      </div>`;
-      if(cfg.storyStyle&&$('cfgStoryStyle'))$('cfgStoryStyle').value=cfg.storyStyle;
-      if(cfg.location&&$('cfgLocation'))$('cfgLocation').value=cfg.location;
-      if(cfg.mood&&$('cfgMood'))$('cfgMood').value=cfg.mood;
+      b.innerHTML=`<div style="text-align:center"><span class="spinner"></span><h2>Actualizando la sala…</h2><p class="muted">Esta sala usa un flujo anterior.</p></div>`;
       return;
     }
 
     if(s.status==='HOST_PROFILE'){
-      const hostP=s.players.find(p=>p.name===s.hostName)||s.players[0];
-      const aiState=s.prepStatus==='READY'?'El guion base ya está preparado.':(s.prepStatus==='GENERATING'?'Gemini está escribiendo el guion mientras completas tu perfil.':'Gemini comenzará a preparar el guion en segundo plano.');
       b.innerHTML=`<div class="stageGrid">
         <div>
-          <div class="phase done"><span class="phaseNum">✓</span><div><strong>Configuración guardada</strong><div class="muted" style="font-size:12px">Ahora conviértete en el primer jugador.</div></div></div>
+          <div class="phase"><span class="phaseNum">1</span><div><strong>Primero crea tu perfil</strong><div class="muted" style="font-size:12px">Eres el primer jugador de la sala.</div></div></div>
           <div class="room-code" style="font-size:46px">${s.room}</div>
-          <div class="status ${s.prepError?'warn':''}">${esc(aiState)}</div>
-          <p class="muted" style="margin-top:12px">El QR para los demás jugadores seguirá oculto hasta que tu perfil esté listo.</p>
+          <p class="muted">Pon tu nombre y una foto. La foto se transforma en caricatura inmediatamente. Después aparecerá el panel completo con configuración, QR y enlace.</p>
+          <div class="actions"><button class="btn ghost" onclick="window.open('${escAttr(L.screenUrl||'')}','_blank')">📺 Ver pantalla</button><button class="btn danger" onclick="closeRoom('${s.room}')">Cerrar sala</button></div>
         </div>
         <div>
-          <div class="phase"><span class="phaseNum">2</span><div><strong>Tu perfil de jugador</strong><div class="muted" style="font-size:12px">Nombre + foto. La IA crea la caricatura automáticamente.</div></div></div>
           <label>Tu nombre</label><input id="hostPlayerName" maxlength="28" autocomplete="name" placeholder="Nombre">
           <label>Tu foto</label>
           <div class="upload">
@@ -271,40 +233,45 @@ function renderHost(s){
             <img id="photoPreview" class="preview hidden" alt="Vista previa">
             <div class="muted" style="font-size:12px">Foto de frente y con buena luz.</div>
           </div>
-          <button class="btn primary big" style="width:100%;margin-top:15px" onclick="joinHostProfile('${s.room}')">Crear mi personaje y continuar</button>
+          <button class="btn primary big" style="width:100%;margin-top:15px" onclick="joinHostProfile('${s.room}')">Crear mi caricatura y abrir el panel</button>
         </div>
       </div>`;
       return;
     }
 
     if(s.status==='WAITING'){
+      const cfg=s.config||{};
       const converting=s.players.filter(p=>p.avatarStatus==='PROCESSING').length;
-      const readyText=!s.blueprintReady
-        ? (s.prepStatus==='GENERATING'?'Gemini está armando el guion base…':'Preparando guion base…')
-        : (!s.casePrepared
-            ? 'Guion base listo · esperando reparto estable para construir el caso.'
-            : ((s.scenesPrepared||0)<s.totalRounds
-                ? `Caso armado · precargando escenas ${s.scenesPrepared||0}/${s.totalRounds}.`
-                : 'Todo preparado: guion, reparto y 5 escenas.'));
       b.innerHTML=`<div class="stageGrid">
         <div>
-          <div class="phase done"><span class="phaseNum">✓</span><div><strong>Tu personaje está dentro</strong><div class="muted" style="font-size:12px">Ahora pueden entrar los demás jugadores.</div></div></div>
+          <div class="phase done"><span class="phaseNum">✓</span><div><strong>Panel de la sala</strong><div class="muted" style="font-size:12px">Comparte el QR y configura el caso mientras entran los jugadores.</div></div></div>
           <div class="waitingText">Código de sala</div><div class="room-code">${s.room}</div>
           <div id="hostQR" class="qr"></div>
           <div class="linkbox" style="margin-top:9px">${esc(L.joinUrl||'')}</div>
           <div class="actions" style="margin-top:9px"><button class="btn ghost" onclick="copyText('${escAttr(L.joinUrl||'')}')">Copiar enlace</button><button class="btn ghost" onclick="window.open('${escAttr(L.screenUrl||'')}','_blank')">Ver partida</button></div>
         </div>
         <div>
-          <div class="phase"><span class="phaseNum">3</span><div><strong>Sala de espera</strong><div class="muted" style="font-size:12px">Cada foto se convierte en caricatura; después la IA arma el caso y precarga las 5 escenas.</div></div></div>
-          <div class="status ${(s.prepError||s.casePrepError)?'warn':''}">${esc(readyText)}${converting?` · ${converting} caricatura(s) procesándose.`:''}${s.casePrepError?` · Algunas escenas no pudieron precargarse.`:''}</div>
+          <div class="phase"><span class="phaseNum">2</span><div><strong>Configurar partida</strong><div class="muted" style="font-size:12px">La historia todavía NO se genera. Solo se guardan estas preferencias.</div></div></div>
+          <label>Tipo de historia</label><select id="cfgStoryStyle"><option>La Mujer de Judas</option><option>Caso original</option><option>Novia enmascarada</option><option>Secretos de familia</option></select>
+          <div class="configGrid"><div><label>Escenario</label><select id="cfgLocation"><option>Aleatoria</option><option>Tren nocturno</option><option>Mansión aislada</option><option>Hotel elegante</option><option>Fiesta privada</option><option>Pueblo venezolano</option><option>Casa de campo</option></select></div><div><label>Tono</label><select id="cfgMood"><option>Telenovela de misterio</option><option>Dramático</option><option>Oscuro</option><option>Intriga elegante</option></select></div></div>
+          <div class="actions" style="margin-top:11px"><button class="btn ghost" onclick="saveLobbyConfig('${s.room}','host')">Guardar configuración</button></div>
           <div class="sep"></div><h3>Jugadores (${s.players.length}/${s.maxPlayers})</h3><div class="players">${playerCards(s.players)}</div>
-          <div class="sep"></div>
-          <button class="btn primary big" style="width:100%" ${s.canStart?'':'disabled'} onclick="hostStart('${s.room}')">Iniciar partida</button>
-          <p class="muted" style="font-size:12px;margin:9px 0 0">${startRequirementText(s)}</p>
+          <div class="status ${converting?'warn':''}" style="margin-top:12px">${converting?`${converting} caricatura(s) procesándose. Espera para iniciar.`:(s.players.length<s.minPlayers?`Necesitas al menos ${s.minPlayers} jugadores.`:'Todo listo para generar el caso.')}</div>
+          <button class="btn primary big" style="width:100%;margin-top:12px" ${s.canStart?'':'disabled'} onclick="hostStart('${s.room}')">Iniciar partida</button>
+          <p class="muted" style="font-size:12px;margin:9px 0 0">Al iniciar se cierra el reparto, Gemini escribe el caso y Cloudflare genera las 5 imágenes. La partida empieza cuando termina todo.</p>
         </div>
       </div>`;
+      if($('cfgStoryStyle'))$('cfgStoryStyle').value=cfg.storyStyle||'La Mujer de Judas';
+      if($('cfgLocation'))$('cfgLocation').value=cfg.location||'Aleatoria';
+      if($('cfgMood'))$('cfgMood').value=cfg.mood||'Telenovela de misterio';
       qr('hostQR',L.joinUrl,180);return;
     }
+
+    if(s.status==='GENERATING'){
+      b.innerHTML=`<div style="text-align:center;padding:34px"><span class="spinner"></span><div class="waitingText" style="margin-top:16px">GENERANDO PARTIDA</div><h2>Creando la historia y las imágenes…</h2><p class="muted">Gemini está escribiendo el caso para ${s.players.length} jugador(es) y Cloudflare está generando las 5 escenas. No cierres esta pantalla.</p></div>`;
+      return;
+    }
+
     b.innerHTML=hostGamePanel(s);
   }
 
@@ -346,95 +313,44 @@ function hostGamePanel(s){
 function startRequirementText(s){
     if(s.players.length<s.minPlayers)return `Faltan ${s.minPlayers-s.players.length} jugador(es).`;
     if(!s.avatarsReady)return 'Espera a que terminen de convertirse todas las fotos en caricaturas.';
-    if(!s.blueprintReady)return 'Gemini todavía está preparando el guion base.';
-    if(!s.casePrepared)return 'La IA está adaptando el guion al reparto y eligiendo víctima/asesino.';
-    if(s.casePrepError)return `El caso está listo, pero una imagen falló al precargarse. Puedes iniciar; el juego intentará continuar con las escenas disponibles.`;
-    if((s.scenesPrepared||0)===0)return 'El caso ya está armado. Preparando la primera imagen de la historia…';
-    if((s.scenesPrepared||0)<s.totalRounds)return `Caso listo. Se están precargando escenas (${s.scenesPrepared||0}/${s.totalRounds}); ya puedes iniciar.`;
-    return 'Todo listo: guion, caricaturas y escenas preparadas.';
+    return 'Listo. Al pulsar iniciar se generarán el guion y las 5 escenas para este reparto.';
   }
-async function finalizeSetup(room){
+
+  async function saveLobbyConfig(room,mode){
+    const prefix=mode==='screen'?'tvCfg':'cfg';
     const config={
-      storyStyle:$('cfgStoryStyle')?.value||'La Mujer de Judas',
-      location:$('cfgLocation')?.value||'Aleatoria',
-      mood:$('cfgMood')?.value||'Telenovela de misterio'
+      storyStyle:$(prefix+'StoryStyle')?.value||'La Mujer de Judas',
+      location:$(prefix+'Location')?.value||'Aleatoria',
+      mood:$(prefix+'Mood')?.value||'Telenovela de misterio'
     };
     try{
       setBusy(true,'Guardando configuración…');
-      await call('apiFinalizeSetup',room,getHostKey(room),config);
-      setBusy(false);
-      toast('Configuración guardada. Ahora crea tu perfil de jugador.','status',3000);
-      await refresh(room,'host');
-      warmStory(STATE||{room,status:'HOST_PROFILE',prepStatus:'PENDING'});
-    }catch(e){setBusy(false);toast(e.message,'error',9000)}
+      await call('apiSaveConfig',room,getHostKey(room),config);
+      toast('Configuración guardada. La historia se generará cuando pulses Iniciar partida.','status',3500);
+    }catch(e){toast(e.message,'error',9000)}
+    finally{setBusy(false);refresh(room,mode==='screen'?'screen':'host')}
   }
 
-  
-function warmStory(s){
-    if(!s||!['HOST_PROFILE','WAITING'].includes(s.status)||s.prepStatus!=='PENDING')return;
-    const key=s.room+':story';if(STORY_WARMED.has(key))return;STORY_WARMED.add(key);
-    google.script.run
-      .withSuccessHandler(r=>{
-        if(r&&r.warning)toast('El guion se preparó con respaldo local: '+r.warning,'warn',7000);
-        setTimeout(()=>{if(STATE&&STATE.room===s.room)refresh(s.room,BOOT.view==='screen'?'screen':'host')},350)
-      })
-      .withFailureHandler(e=>{
-        STORY_WARMED.delete(key);
-        toast('No se pudo preparar el guion todavía: '+(e&&e.message?e.message:e),'warn',7000)
-      })
-      .apiPrepareStory(s.room,getHostKey(s.room));
-  }
-
-  
-async function joinHostProfile(room){
+  async function joinHostProfile(room){
     const n=($('hostPlayerName')?.value||'').trim();
     if(!n)return toast('Escribe tu nombre.','warn');
     if(!joinPhoto)return toast('Necesitas una foto.','warn');
     try{
-      setBusy(true,'Creando tu caricatura con IA…');
+      setBusy(true,'Convirtiendo tu foto en caricatura…');
       const r=await call('apiJoinHost',room,getHostKey(room),n,joinPhoto);
       if(r.token)localStorage.setItem(roomStore(room),r.token);
       if(r.warning)toast(r.warning,'warn',9000);
       joinPhoto='';
-      toast('Tu personaje está listo. Ya puedes abrir la sala a los demás jugadores.','status',3000);
+      toast('Perfil listo. El panel de sala ya está abierto.','status',3000);
     }catch(e){toast(e.message,'error',9000)}
     finally{setBusy(false);refresh(room,'host')}
   }
 
-
-function warmCase(s){
-    if(!s||s.status!=='WAITING'||!s.isHost)return;
-    if(s.players.length<s.minPlayers||!s.avatarsReady||!s.blueprintReady)return;
-
-    const rosterKey=s.players.map(p=>`${p.playerId}:${p.avatarFileId||''}`).sort().join('|');
-    if(rosterKey!==LAST_ROSTER_KEY){
-      LAST_ROSTER_KEY=rosterKey;
-      LAST_ROSTER_AT=Date.now();
-      return;
-    }
-
-    // Espera unos segundos sin cambios para evitar gastar imágenes si todavía están entrando jugadores.
-    if(Date.now()-LAST_ROSTER_AT<6500||CASE_BUSY)return;
-
-    CASE_BUSY=true;
-    const action=!s.casePrepared?'apiPrepareCase':(((s.scenesPrepared||0)<s.totalRounds&&s.casePrepStatus!=='ERROR')?'apiPrepareCaseStep':'');
-    if(!action){CASE_BUSY=false;return}
-
-    google.script.run
-      .withSuccessHandler(r=>{
-        CASE_BUSY=false;
-        if(r&&r.error)toast('Una escena no pudo prepararse todavía: '+r.error,'warn',7000);
-        setTimeout(()=>{if(STATE&&STATE.room===s.room)refresh(s.room,BOOT.view==='screen'?'screen':'host')},250);
-      })
-      .withFailureHandler(e=>{
-        CASE_BUSY=false;
-        toast('La preparación continúa, pero hubo un fallo temporal: '+(e&&e.message?e.message:e),'warn',6000);
-      })[action](s.room,getHostKey(s.room));
-  }
-
+  
 function renderPlayer(s){
     const b=$('playerBody');if(!b)return;const me=s.privatePlayer;if(!me){b.innerHTML='<div class="status error">No encuentro tu sesión. Vuelve a entrar con el código.</div>';return}
     if(s.status==='WAITING'){const meP=s.players.find(p=>p.playerId===me.playerId);const meImg=meP&&meP.avatarFileId&&asset(meP.avatarFileId)?`<img class="preview" src="${asset(meP.avatarFileId)}">`:'<div style="margin:20px auto;width:136px"><span class="spinner"></span></div>';b.innerHTML=`<div style="text-align:center">${meImg}<h2>${esc(me.name)}, estás dentro</h2><p class="muted">Tu personaje ya está preparado. Espera a que el anfitrión pulse <strong>Iniciar partida</strong>.</p><div class="room-code" style="font-size:42px">${s.room}</div></div>`;return}
+    if(s.status==='GENERATING'){b.innerHTML=`<div style="text-align:center;padding:22px"><span class="spinner"></span><div class="waitingText" style="margin-top:14px">CASO EN CREACIÓN</div><h2>La historia se está generando</h2><p class="muted">Gemini está escribiendo el caso con los jugadores que entraron y Cloudflare está creando las escenas. Progreso: ${s.scenesPrepared||0}/${s.totalRounds} imágenes.</p></div>`;return}
     if(s.status==='CLOSED'){b.innerHTML='<h2>Sala cerrada</h2><p class="muted">El anfitrión finalizó la partida.</p>';return}
     const roleClass=me.role==='KILLER'?'killer':me.role==='VICTIM'?'victim':'';
     let html=`<div class="roleBox ${roleClass}"><div class="waitingText">Tu papel privado</div><div class="roleTitle">${roleName(me.role)}</div><p>${esc(me.secret)}</p><div class="sep"></div><strong>Tu versión</strong><p class="muted">${esc(me.alibi)}</p></div>`;
@@ -451,32 +367,39 @@ function renderScreen(s){
       b.innerHTML=`<div class="reveal"><div><div class="waitingText">SALA CERRADA</div><h1>Partida finalizada</h1><button class="btn primary big" onclick="location.href=baseUrl()">Volver al inicio</button></div></div>`;
       return;
     }
-    if(s.status==='SETUP'){
-      b.innerHTML=`<div class="tvHead"><div class="tvTitle brand">¿Quién <span class="red">mató</span> a...?</div><span class="badge">PASO 1 · CONFIGURACIÓN</span></div>
-      <div class="tvSetup"><div class="tvSetupHero"><div class="waitingText">Sala creada</div><h1>Primero configura<br>el anfitrión.</h1><p class="lead">Este QR es solo para el anfitrión. En su móvil define el tipo de caso, escenario y tono. Todavía no se pide nombre ni foto.</p><div class="room-code">${s.room}</div></div>
-      <div class="setupQRBlock"><div id="hostSetupQR" class="qr"></div><h2 style="margin:13px 0 4px">Configurar sala</h2><p class="muted">Escanea desde el móvil del anfitrión.</p></div></div>
-      <div class="progress"><span class="dot on"></span><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>`;
+
+    // Flujo nuevo: Ver pantalla crea la sala y muestra un QR exclusivo para
+    // que el anfitrión cree primero su perfil.
+    if(s.status==='HOST_PROFILE'||s.status==='SETUP'){
+      b.innerHTML=`<div class="tvHead"><div class="tvTitle brand">¿Quién <span class="red">mató</span> a...?</div><span class="badge">ANFITRIÓN</span></div>
+      <div class="tvSetup"><div class="tvSetupHero"><div class="waitingText">Sala ${s.room}</div><h1>Primero entra<br>el anfitrión.</h1><p class="lead">Escanea este QR desde el móvil. Pon tu nombre y foto; la IA la convertirá en caricatura. Después esta misma pantalla se transforma en el panel central de la sala.</p></div>
+      <div class="setupQRBlock"><div id="hostSetupQR" class="qr"></div><h2 style="margin:13px 0 4px">Crear perfil del anfitrión</h2><p class="muted">Este QR es solo para quien controla la partida.</p></div></div>
+      <div class="progress"><span class="dot on"></span><span class="dot"></span><span class="dot"></span></div>`;
       if(L.hostUrl)qr('hostSetupQR',L.hostUrl,250);return;
     }
-    if(s.status==='HOST_PROFILE'){
-      const p=s.players&&s.players[0];
-      const status=s.prepStatus==='READY'?'Guion base preparado':(s.prepStatus==='GENERATING'?'Gemini está preparando el guion…':'Preparando guion…');
-      b.innerHTML=`<div class="tvHead"><div class="tvTitle brand">¿Quién <span class="red">mató</span> a...?</div><span class="badge">PASO 2 · ANFITRIÓN</span></div>
-      <div class="tvSetup"><div class="tvSetupHero"><div class="waitingText">Configuración guardada</div><h1>Ahora falta<br>el anfitrión.</h1><p class="lead">En el móvil debe poner su nombre y foto. La IA transformará la foto en caricatura antes de mostrar el QR general.</p><div class="status">${esc(status)}</div></div>
-      <div class="setupQRBlock">${p?avatarMarkup(p):'<span class="spinner"></span>'}<h2 style="margin:13px 0 4px">${p?esc(p.name):'Creando primer personaje'}</h2><p class="muted">El QR de jugadores aparecerá después.</p></div></div>
-      <div class="progress"><span class="dot on"></span><span class="dot on"></span><span class="dot"></span><span class="dot"></span></div>`;
-      return;
-    }
+
     if(s.status==='WAITING'){
+      const cfg=s.config||{};
       const converting=s.players.filter(p=>p.avatarStatus==='PROCESSING').length;
-      b.innerHTML=`<div class="tvHead"><div class="tvTitle brand">¿Quién <span class="red">mató</span> a...?</div><span class="badge">SALA DE ESPERA</span></div>
-      <div class="lobbyTv"><div class="lobbyLeft"><div class="waitingText">PASO 3 · JUGADORES</div><div class="room-code">${s.room}</div><div id="tvQR" class="qr" style="margin:12px auto"></div>
-      <h2 style="margin:7px 0">Escanead, poned nombre y foto</h2>
-      <p class="muted">${s.players.length}/${s.maxPlayers} jugadores${converting?` · ${converting} caricatura(s) en proceso`:''}</p>
-      <div class="status ${s.blueprintReady?'':'warn'}">${!s.blueprintReady?(s.prepStatus==='GENERATING'?'Gemini está preparando el guion…':'Iniciando el guion en segundo plano…'):(!s.casePrepared?'Guion listo · adaptando el caso al reparto…':((s.scenesPrepared||0)<s.totalRounds?`Caso armado · escenas ${s.scenesPrepared||0}/${s.totalRounds}`:'Caso y 5 escenas preparados'))}</div>${screenControls(s)}</div>
-      <div class="players lobbyPlayers">${playerCards(s.players)}</div></div>
-      <div class="progress"><span class="dot on"></span><span class="dot on"></span><span class="dot on"></span><span class="dot"></span></div>`;
-      qr('tvQR',L.joinUrl||baseUrl()+'?view=join&room='+s.room,205);return;
+      b.innerHTML=`<div class="tvHead"><div class="tvTitle brand">¿Quién <span class="red">mató</span> a...?</div><span class="badge">PANEL · SALA ${s.room}</span></div>
+      <div class="tvMain" style="grid-template-columns:minmax(280px,.72fr) minmax(0,1.3fr)">
+        <aside class="side" style="grid-template-rows:auto auto 1fr">
+          <div class="evidence"><div class="eyebrow">CONFIGURACIÓN</div><label>Historia</label><select id="tvCfgStoryStyle"><option>La Mujer de Judas</option><option>Caso original</option><option>Novia enmascarada</option><option>Secretos de familia</option></select><label>Escenario</label><select id="tvCfgLocation"><option>Aleatoria</option><option>Tren nocturno</option><option>Mansión aislada</option><option>Hotel elegante</option><option>Fiesta privada</option><option>Pueblo venezolano</option><option>Casa de campo</option></select><label>Tono</label><select id="tvCfgMood"><option>Telenovela de misterio</option><option>Dramático</option><option>Oscuro</option><option>Intriga elegante</option></select><button class="btn ghost" style="width:100%;margin-top:9px" onclick="saveLobbyConfig('${s.room}','screen')">Guardar configuración</button></div>
+          <div class="tvJoin"><div id="tvQR" class="qr"></div><div><div class="waitingText">UNIRSE</div><strong style="font-size:25px">${s.room}</strong><div class="linkbox" style="margin-top:6px">${esc(L.joinUrl||'')}</div><button class="btn ghost" style="margin-top:6px" onclick="copyText('${escAttr(L.joinUrl||'')}')">Copiar enlace</button></div></div>
+          <div>${screenControls(s)}</div>
+        </aside>
+        <section class="scene" style="padding:14px;overflow:auto"><div class="waitingText">JUGADORES · ${s.players.length}/${s.maxPlayers}</div><h2 style="margin:5px 0 10px">Sala de espera</h2><p class="muted" style="margin-bottom:10px">${converting?`${converting} foto(s) convirtiéndose en caricatura.`:(s.players.length<s.minPlayers?`Con ${s.minPlayers} jugadores ya puedes iniciar.`:'Listo para iniciar cuando quieras.')}</p><div class="players lobbyPlayers">${playerCards(s.players)}</div></section>
+      </div>
+      <div class="progress"><span class="dot on"></span><span class="dot on"></span><span class="dot"></span></div>`;
+      if($('tvCfgStoryStyle'))$('tvCfgStoryStyle').value=cfg.storyStyle||'La Mujer de Judas';
+      if($('tvCfgLocation'))$('tvCfgLocation').value=cfg.location||'Aleatoria';
+      if($('tvCfgMood'))$('tvCfgMood').value=cfg.mood||'Telenovela de misterio';
+      qr('tvQR',L.joinUrl||baseUrl()+'?view=join&room='+s.room,126);return;
+    }
+
+    if(s.status==='GENERATING'){
+      b.innerHTML=`<div class="reveal" style="background:radial-gradient(circle,#27151e,#08090d 68%)"><div><span class="spinner" style="width:44px;height:44px"></span><div class="waitingText" style="margin-top:18px">GENERANDO PARTIDA</div><h1>Creando el caso…</h1><p class="lead">Gemini está escribiendo una historia exclusiva para ${s.players.length} jugador(es) y Cloudflare genera las 5 imágenes. Progreso: ${s.scenesPrepared||0}/${s.totalRounds}.</p><div class="status" style="max-width:650px;margin:16px auto">Puede tardar un poco. No cierres esta pantalla.</div></div></div><div class="progress"><span class="dot on"></span><span class="dot on"></span><span class="dot on"></span></div>`;
+      return;
     }
     if(s.status==='REVEAL'&&s.result){
       const k=s.players.find(p=>p.playerId===s.result.killerId);
@@ -497,7 +420,7 @@ function renderScreen(s){
   function screenControls(s){
     if(!s.isHost)return '';
     let controls='';
-    if(s.status==='WAITING')controls=`<div style="width:100%;font-size:11px;color:#aaa8a4;margin-bottom:2px">PASO 4 · iniciar cuando el caso esté listo</div><button class="btn primary big" ${s.canStart?'':'disabled'} onclick="screenStart('${s.room}')">Iniciar partida</button>`;
+    if(s.status==='WAITING')controls=`<div style="width:100%;font-size:11px;color:#aaa8a4;margin-bottom:2px">Con 2 jugadores y las caricaturas listas ya puedes iniciar</div><button class="btn primary big" ${s.canStart?'':'disabled'} onclick="screenStart('${s.room}')">Iniciar partida</button>`;
     if(s.status==='ROUND'&&s.round<s.totalRounds)controls=`<button class="btn primary big" onclick="screenNextRound('${s.room}')">Siguiente ronda</button>`;
     if(s.status==='ROUND'&&s.round===s.totalRounds)controls=`<button class="btn gold big" onclick="screenOpenVoting('${s.room}')">Abrir votación final</button>`;
     if(s.status==='VOTING')controls=`<button class="btn primary big" onclick="screenReveal('${s.room}')">Revelar asesino</button>`;
@@ -513,16 +436,57 @@ function renderScreen(s){
 
   function victimName(s){const p=s.players.find(x=>x.playerId===s.victimId);return p?p.name:'XXXXX'}
   function roleName(r){return r==='KILLER'?'TÚ ERES EL ASESINO':r==='VICTIM'?'TÚ ERES LA VÍCTIMA':'ERES SOSPECHOSO'}
-  function statusText(s){if(s.status==='WAITING')return 'Jugadores entrando.';if(s.status==='ROUND')return `Ronda ${s.round} de ${s.totalRounds}.`;if(s.status==='VOTING')return 'Votación final abierta.';if(s.status==='REVEAL')return 'Caso resuelto.';return s.status}
+  function statusText(s){if(s.status==='WAITING')return 'Jugadores entrando.';if(s.status==='GENERATING')return 'Generando historia e imágenes.';if(s.status==='ROUND')return `Ronda ${s.round} de ${s.totalRounds}.`;if(s.status==='VOTING')return 'Votación final abierta.';if(s.status==='REVEAL')return 'Caso resuelto.';return s.status}
   function dots(n,total){return Array.from({length:total},(_,i)=>`<span class="dot ${i<n?'on':''}"></span>`).join('')}
   function qr(id,text,size){const el=$(id);if(!el||!text||typeof QRCode==='undefined')return;el.innerHTML='';new QRCode(el,{text,width:size,height:size,colorDark:'#000000',colorLight:'#ffffff',correctLevel:QRCode.CorrectLevel.M})}
   function copyText(t){navigator.clipboard?.writeText(t);toast('Enlace copiado.','status',1800)}
 
-  async function hostStart(room){try{setBusy(true,'Iniciando partida…');const r=await call('apiStart',room,getHostKey(room));if(r.warning)toast(r.warning,'warn',9000)}catch(e){toast(e.message,'error',9000)}finally{setBusy(false);refresh(room,'host')}}
+  async function generateAndStart(room,mode){
+    const hk=getHostKey(room);
+    const target=mode==='screen'?'screenBody':'hostBody';
+    const renderProgress=(step,text)=>{
+      const b=$(target);if(!b)return;
+      const pct=Math.round((step/6)*100);
+      b.innerHTML=`<div class="reveal" style="background:radial-gradient(circle,#27151e,#08090d 68%)"><div><span class="spinner" style="width:44px;height:44px"></span><div class="waitingText" style="margin-top:18px">GENERANDO PARTIDA · ${pct}%</div><h1>${esc(text)}</h1><p class="lead">La partida empezará automáticamente cuando el guion y las 5 escenas estén listas.</p></div></div>`;
+    };
+    let warning='';
+    try{
+      setBusy(true,'Generando la partida…');
+      // Iniciar también guarda automáticamente lo que esté seleccionado en el panel.
+      const prefix=mode==='screen'?'tvCfg':'cfg';
+      const config={
+        storyStyle:$(prefix+'StoryStyle')?.value||STATE?.config?.storyStyle||'La Mujer de Judas',
+        location:$(prefix+'Location')?.value||STATE?.config?.location||'Aleatoria',
+        mood:$(prefix+'Mood')?.value||STATE?.config?.mood||'Telenovela de misterio'
+      };
+      await call('apiSaveConfig',room,hk,config);
+      renderProgress(0,'Escribiendo la historia…');
+      const start=await call('apiStart',room,hk);
+      if(!start||start.ok===false)throw new Error(start?.error||'No se pudo preparar la historia.');
+      warning=start.warning||'';
+      for(let round=1;round<=5;round++){
+        renderProgress(round,`Generando imagen ${round} de 5…`);
+        const r=await call('apiGenerateStartScene',room,hk,round);
+        if(!r||r.ok===false)throw new Error(r?.error||`No se pudo generar la imagen ${round}.`);
+      }
+      renderProgress(6,'Preparando la primera ronda…');
+      const fin=await call('apiFinishStart',room,hk);
+      if(!fin||fin.ok===false)throw new Error(fin?.error||'No se pudo iniciar la partida.');
+      if(warning)toast(warning,'warn',9000);
+    }catch(e){
+      try{await call('apiCancelGeneration',room,hk)}catch(_e){}
+      toast(e.message,'error',12000);
+    }finally{
+      setBusy(false);
+      refresh(room,mode);
+    }
+  }
+
+  async function hostStart(room){return generateAndStart(room,'host')}
   async function nextRound(room){try{setBusy(true,'Cambiando de ronda...');const r=await call('apiNextRound',room,getHostKey(room));if(r.warning)toast(r.warning,'warn',9000)}catch(e){toast(e.message,'error')}finally{setBusy(false);refresh(room,'host')}}
   async function openVoting(room){try{setBusy(true,'Abriendo votación...');await call('apiOpenVoting',room,getHostKey(room))}catch(e){toast(e.message,'error')}finally{setBusy(false);refresh(room,'host')}}
   async function reveal(room){try{setBusy(true,'Revelando la verdad...');await call('apiReveal',room,getHostKey(room));confetti()}catch(e){toast(e.message,'error')}finally{setBusy(false);refresh(room,'host')}}
-  async function screenStart(room){try{setBusy(true,'Iniciando partida…');const r=await call('apiStart',room,getHostKey(room));if(r.warning)toast(r.warning,'warn',9000)}catch(e){toast(e.message,'error',9000)}finally{setBusy(false);refresh(room,'screen')}}
+  async function screenStart(room){return generateAndStart(room,'screen')}
   async function screenNextRound(room){try{setBusy(true,'Cambiando de ronda...');const r=await call('apiNextRound',room,getHostKey(room));if(r.warning)toast(r.warning,'warn',9000)}catch(e){toast(e.message,'error')}finally{setBusy(false);refresh(room,'screen')}}
   async function screenOpenVoting(room){try{setBusy(true,'Abriendo votación...');await call('apiOpenVoting',room,getHostKey(room))}catch(e){toast(e.message,'error')}finally{setBusy(false);refresh(room,'screen')}}
   async function screenReveal(room){try{setBusy(true,'Revelando la verdad...');await call('apiReveal',room,getHostKey(room));confetti()}catch(e){toast(e.message,'error')}finally{setBusy(false);refresh(room,'screen')}}
